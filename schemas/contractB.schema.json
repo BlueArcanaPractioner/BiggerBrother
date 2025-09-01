@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/contract.schema.json",
+  "title": "Feature Contract",
+  "type": "object",
+  "required": [
+    "feature_id",
+    "intent",
+    "user_story",
+    "inputs",
+    "outputs",
+    "dependencies",
+    "observability",
+    "preconditions",
+    "postconditions",
+    "invariants",
+    "forbidden_shortcuts",
+    "acceptance_tests"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "feature_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "intent": {
+      "type": "string",
+      "minLength": 1
+    },
+    "user_story": {
+      "type": "string",
+      "minLength": 1
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "source",
+        "target"
+      ]
+    },
+    "outputs": {
+      "type": "object",
+      "description": "High-level outputs / side-effects; e.g., updated store entities, emitted events.",
+      "additionalProperties": true
+    },
+    "dependencies": {
+      "type": "object",
+      "required": [
+        "required_symbols",
+        "integration_contracts"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "required_symbols": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.()]*$"
+          },
+          "minItems": 1
+        },
+        "integration_contracts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0
+        }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "required": [
+        "log_events",
+        "metrics"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "log_events": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "preconditions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 0
+    },
+    "postconditions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "invariants": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 0
+    },
+    "forbidden_shortcuts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 0
+    },
+    "acceptance_tests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "perf_budget": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "number",
+          "integer",
+          "string"
+        ]
+      }
+    },
+    "repair_budget": {
+      "type": "object",
+      "properties": {
+        "max_commits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_diff_lines": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

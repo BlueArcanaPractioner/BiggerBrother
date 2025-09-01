@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "log_entry.schema.json",
+  "title": "Log Entry",
+  "description": "A timestamped log entry for tracking",
+  "type": "object",
+  "required": ["id", "category", "timestamp"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "UUID for the log entry"
+    },
+    "category": {
+      "type": "string",
+      "enum": ["nutrition", "medication", "exercise", "mood", "sleep", "task", "energy", "focus", "social", "custom"]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "value": {
+      "oneOf": [
+        {"type": "number"},
+        {"type": "string"},
+        {"type": "boolean"},
+        {"type": "object"}
+      ],
+      "description": "Category-specific value"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "default": 1.0
+    },
+    "source": {
+      "type": "string",
+      "enum": ["manual", "imported", "inferred", "device"],
+      "default": "manual"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/edge.schema.json",
+  "title": "Edge",
+  "description": "Directed edge connecting two nodes in the knowledge graph",
+  "type": "object",
+  "required": ["id", "src", "dst", "kind", "created_at"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$",
+      "description": "UUID v4 identifier for the edge"
+    },
+    "src": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Source node identifier (may be UUID or external reference)"
+    },
+    "dst": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Destination node identifier (may be UUID or external reference)"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "relates_to",
+        "follows",
+        "contradicts",
+        "supports",
+        "implements",
+        "blocks",
+        "contains",
+        "references"
+      ],
+      "description": "The type of relationship this edge represents"
+    },
+    "weight": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "default": 1.0,
+      "description": "Strength or confidence of the relationship"
+    },
+    "attrs": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Additional metadata for the edge"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of edge creation"
+    }
+  }
+}

@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/harmonization_tier.schema.json",
+  "title": "HarmonizationTier v1.0.0",
+  "description": "Schema for two-tier label harmonization groups (general and specific)",
+  "type": "object",
+  "required": ["timestamp", "threshold", "tier", "description", "topic", "tone", "intent"],
+  "properties": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of when this harmonization was generated"
+    },
+    "threshold": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Similarity threshold for this tier (0.5 for general, 0.8 for specific)"
+    },
+    "tier": {
+      "type": "string",
+      "enum": ["general", "specific"],
+      "description": "Which tier of harmonization this represents"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description of this tier's purpose"
+    },
+    "topic": {
+      "$ref": "#/$defs/categoryHarmonization",
+      "description": "Topic label harmonization groups"
+    },
+    "tone": {
+      "$ref": "#/$defs/categoryHarmonization",
+      "description": "Tone label harmonization groups"
+    },
+    "intent": {
+      "$ref": "#/$defs/categoryHarmonization",
+      "description": "Intent label harmonization groups"
+    }
+  },
+  "additionalProperties": false,
+  
+  "$defs": {
+    "categoryHarmonization": {
+      "type": "object",
+      "required": ["groups", "group_count", "total_labels"],
+      "properties": {
+        "groups": {
+          "type": "object",
+          "description": "Map of canonical label to array of harmonized variants",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1,
+            "uniqueItems": true,
+            "$comment": "Each group should contain the canonical label plus any variants mapped to it"
+          }
+        },
+        "group_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of distinct groups in this category"
+        },
+        "total_labels": {
+          "type": "integer", 
+          "minimum": 0,
+          "description": "Total number of labels (including variants) in this category"
+        },
+        "statistics": {
+          "type": "object",
+          "description": "Optional statistics about the harmonization",
+          "properties": {
+            "avg_group_size": {
+              "type": "number",
+              "minimum": 1,
+              "description": "Average number of labels per group"
+            },
+            "max_group_size": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Size of the largest group"
+            },
+            "singleton_count": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of groups with only one label (unique concepts)"
+            },
+            "coverage_ratio": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Ratio of labels that are harmonized vs unique"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  
+  "examples": [
+    {
+      "timestamp": "2025-01-01T12:00:00.000000+00:00",
+      "threshold": 0.5,
+      "tier": "general",
+      "description": "Broader groupings for general concepts",
+      "topic": {
+        "groups": {
+          "rpg_campaign_planning": [
+            "rpg_campaign_planning",
+            "rpg_campaign_prep",
+            "campaign_planning",
+            "rpg_planning",
+            "d&d_campaign_planning"
+          ],
+          "worldbuilding": [
+            "worldbuilding",
+            "world_building",
+            "world-building",
+            "setting_creation"
+          ]
+        },
+        "group_count": 2,
+        "total_labels": 9
+      },
+      "tone": {
+        "groups": {
+          "humorous": [
+            "humorous",
+            "funny",
+            "comedic",
+            "playful"
+          ]
+        },
+        "group_count": 1,
+        "total_labels": 4
+      },
+      "intent": {
+        "groups": {
+          "worldbuilding_assistance": [
+            "worldbuilding_assistance",
+            "worldbuilding_help",
+            "setting_help"
+          ]
+        },
+        "group_count": 1,
+        "total_labels": 3
+      }
+    },
+    {
+      "timestamp": "2025-01-01T12:00:00.000000+00:00",
+      "threshold": 0.8,
+      "tier": "specific",
+      "description": "Fine-grained groupings for specific concepts",
+      "topic": {
+        "groups": {
+          "rpg_campaign_planning": [
+            "rpg_campaign_planning",
+            "rpg_campaign_prep"
+          ],
+          "d&d_campaign_planning": [
+            "d&d_campaign_planning",
+            "dnd_campaign_planning"
+          ],
+          "worldbuilding": [
+            "worldbuilding",
+            "world_building"
+          ]
+        },
+        "group_count": 3,
+        "total_labels": 6,
+        "statistics": {
+          "avg_group_size": 2.0,
+          "max_group_size": 2,
+          "singleton_count": 0,
+          "coverage_ratio": 1.0
+        }
+      },
+      "tone": {
+        "groups": {
+          "humorous": [
+            "humorous",
+            "funny"
+          ],
+          "playful": [
+            "playful",
+            "lighthearted"
+          ]
+        },
+        "group_count": 2,
+        "total_labels": 4
+      },
+      "intent": {
+        "groups": {
+          "worldbuilding_assistance": [
+            "worldbuilding_assistance",
+            "worldbuilding_help"
+          ]
+        },
+        "group_count": 1,
+        "total_labels": 2
+      }
+    }
+  ]
+}

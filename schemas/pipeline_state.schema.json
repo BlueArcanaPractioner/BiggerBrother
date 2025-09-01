@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "pipeline_state.schema.json",
+  "title": "Pipeline State",
+  "description": "Current state of the integrated analysis pipeline",
+  "type": "object",
+  "required": ["timestamp", "stats"],
+  "properties": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "stats": {
+      "type": "object",
+      "properties": {
+        "total_chunks_processed": {"type": "integer"},
+        "total_batches_created": {"type": "integer"},
+        "total_activities_inferred": {"type": "integer"},
+        "total_activities_crystallized": {"type": "integer"},
+        "total_profile_facts": {"type": "integer"},
+        "processing_time_seconds": {"type": "number"},
+        "cache_hit_rate": {"type": "number"},
+        "messages_skipped": {"type": "integer"}
+      }
+    },
+    "current_batch": {
+      "type": "object",
+      "properties": {
+        "batch_id": {"type": "string"},
+        "message_count": {"type": "integer"},
+        "char_count": {"type": "integer"}
+      }
+    },
+    "active_hypotheses": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "IDs of currently active hypotheses"
+    },
+    "last_checkpoint": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

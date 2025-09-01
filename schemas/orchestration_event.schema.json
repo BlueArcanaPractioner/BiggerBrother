@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/orchestration_event.schema.json",
+  "title": "Orchestration Event",
+  "description": "Events logged during orchestrator execution of the self-building agent pipeline",
+  "type": "object",
+  "required": ["event", "timestamp"],
+  "additionalProperties": true,
+  "properties": {
+    "event": {
+      "type": "string",
+      "enum": [
+        "load_contract",
+        "plan_created",
+        "module_start",
+        "skip_module",
+        "module_written",
+        "skip_test",
+        "test_written",
+        "test_start",
+        "test_complete",
+        "internal_fix_start",
+        "internal_fix_done",
+        "swe_engineer_invoked",
+        "run_complete"
+      ],
+      "description": "The type of event that occurred"
+    },
+    "timestamp": {
+      "type": "number",
+      "description": "Unix timestamp of when the event occurred"
+    },
+    "module": {
+      "type": "string",
+      "description": "The module name being processed"
+    },
+    "path": {
+      "type": "string",
+      "description": "File system path relevant to the event"
+    },
+    "modules": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of module names (for plan_created event)"
+    },
+    "rc": {
+      "type": "integer",
+      "description": "Return code from a process execution"
+    },
+    "returncode": {
+      "type": "integer",
+      "description": "Alternative field for return code"
+    },
+    "success": {
+      "type": "boolean",
+      "description": "Whether the overall operation succeeded"
+    },
+    "run_dir": {
+      "type": "string",
+      "description": "Directory where SWE agent execution occurred"
+    },
+    "base_sha": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$",
+      "description": "Git commit SHA used as base"
+    },
+    "branch": {
+      "type": "string",
+      "description": "Git branch name"
+    },
+    "stdout": {
+      "type": "string",
+      "description": "Standard output from process execution"
+    },
+    "stderr": {
+      "type": "string",
+      "description": "Standard error from process execution"
+    }
+  }
+}

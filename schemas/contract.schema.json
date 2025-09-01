@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/contract.schema.json",
+  "title": "Feature Contract (Hardened)",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "feature_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "intent": {
+      "type": "string",
+      "minLength": 1
+    },
+    "user_story": {
+      "type": "string"
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required_symbols": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "FQNs such as 'runner.openai_client.OpenAIClient.complete()'"
+        },
+        "integration_contracts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Named field-map or interface contracts referenced by the feature"
+        }
+      },
+      "required": [
+        "required_symbols"
+      ]
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "log_events": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "invariants": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "perf_budget": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "max_latency_ms": {
+          "type": "number"
+        },
+        "max_cpu_pct": {
+          "type": "number"
+        },
+        "max_mem_mb": {
+          "type": "number"
+        }
+      }
+    },
+    "repair_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_commits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_diff_lines": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "max_commits"
+      ]
+    },
+    "forbidden_shortcuts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "acceptance_tests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "test_path": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "goal": {
+      "type": "string"
+    },
+    "models": {
+      "type": "object"
+    },
+    "schemas": {
+      "type": "object"
+    },
+    "modules": {
+      "type": "object"
+    },
+    "api": {
+      "type": "object"
+    },
+    "constraints": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "feature_id",
+    "intent",
+    "inputs",
+    "outputs"
+  ]
+}

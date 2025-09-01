@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "person_entity.schema.json",
+  "title": "Person Entity",
+  "description": "Anonymized representation of a person mentioned in conversations",
+  "type": "object",
+  "required": ["anonymous_id"],
+  "properties": {
+    "anonymous_id": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{8}$",
+      "description": "8-character anonymized hash"
+    },
+    "relationship": {
+      "type": "string",
+      "enum": ["friend", "colleague", "family", "partner", "acquaintance", "professional", "unknown"]
+    },
+    "first_mentioned": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_mentioned": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "mention_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "associated_activities": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Activity categories associated with this person"
+    },
+    "notes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Contextual notes (without identifying info)"
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "context_batch.schema.json",
+  "title": "Context Batch",
+  "description": "A batch of messages ready for processing",
+  "type": "object",
+  "required": ["batch_id", "total_chars", "start_time", "end_time", "message_count"],
+  "properties": {
+    "batch_id": {
+      "type": "string",
+      "pattern": "^[a-f0-9-]{8}$"
+    },
+    "total_chars": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 150000
+    },
+    "start_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "end_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "message_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "has_priority_content": {
+      "type": "boolean"
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "activity_categories": {
+          "type": "object",
+          "additionalProperties": {"type": "integer"}
+        },
+        "profile_categories": {
+          "type": "object",
+          "additionalProperties": {"type": "integer"}
+        }
+      }
+    }
+  }
+}

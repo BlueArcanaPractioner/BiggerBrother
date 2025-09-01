@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "profile_snapshot.schema.json",
+  "title": "Profile Snapshot",
+  "description": "Point-in-time snapshot of user profile",
+  "type": "object",
+  "required": ["timestamp", "version", "trigger", "stats"],
+  "properties": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "trigger": {
+      "type": "string",
+      "enum": ["periodic_update", "manual", "significant_change", "initialization"]
+    },
+    "fact_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "stats": {
+      "type": "object",
+      "properties": {
+        "total_facts": {"type": "integer"},
+        "categories": {
+          "type": "object",
+          "additionalProperties": {"type": "integer"}
+        },
+        "people_tracked": {"type": "integer"},
+        "avg_confidence": {"type": "number"}
+      }
+    },
+    "fact_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "IDs of facts in this snapshot"
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SYMBOL_MAP",
+  "type": "object",
+  "patternProperties": {
+    "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*(\\.[A-Za-z_][A-Za-z0-9_]*\\(\\))?$": {
+      "type": "object",
+      "required": [
+        "file",
+        "line",
+        "signature"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "signature": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

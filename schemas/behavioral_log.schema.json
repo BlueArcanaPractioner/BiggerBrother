@@ -1,0 +1,143 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "behavioral_log_entry.schema.json",
+  "title": "Behavioral Log Entry",
+  "description": "Rich behavioral log with conversation context",
+  "type": "object",
+  "required": ["id", "category", "timestamp", "conversation_context"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "UUID for the log entry"
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "nutrition", 
+        "medication", 
+        "exercise", 
+        "mood", 
+        "sleep", 
+        "task", 
+        "energy", 
+        "focus", 
+        "social", 
+        "creative",
+        "learning",
+        "reflection",
+        "planning",
+        "custom"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "value": {
+      "oneOf": [
+        {"type": "number"},
+        {"type": "string"},
+        {"type": "boolean"},
+        {"type": "object"}
+      ],
+      "description": "Category-specific value"
+    },
+    "conversation_context": {
+      "type": "object",
+      "required": ["state", "mode"],
+      "properties": {
+        "state": {
+          "type": "object",
+          "description": "Harmonized conversation state at time of logging",
+          "properties": {
+            "topic": {"type": "array", "items": {"type": "string"}},
+            "tone": {"type": "array", "items": {"type": "string"}},
+            "intent": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["check_in", "explorer", "target_behavior", "quick_log", "reflection"],
+          "description": "Conversation mode active during logging"
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Links to conversation session"
+        },
+        "preceding_messages": {
+          "type": "integer",
+          "description": "Number of messages in conversation before behavior"
+        },
+        "time_to_behavior": {
+          "type": "number",
+          "description": "Minutes from conversation start to logged behavior"
+        }
+      }
+    },
+    "behavioral_metadata": {
+      "type": "object",
+      "properties": {
+        "planned": {
+          "type": "boolean",
+          "description": "Was this behavior planned in conversation?"
+        },
+        "spontaneous": {
+          "type": "boolean",
+          "description": "Did this happen without explicit planning?"
+        },
+        "resistance_overcome": {
+          "type": "boolean",
+          "description": "Was there initial resistance in conversation?"
+        },
+        "conversation_helpful": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 10,
+          "description": "User rating of conversation helpfulness"
+        },
+        "followed_suggestion": {
+          "type": "boolean",
+          "description": "Did user follow AI suggestion?"
+        },
+        "alternative_chosen": {
+          "type": "string",
+          "description": "If user chose different action than suggested"
+        }
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "properties": {
+        "completed": {"type": "boolean"},
+        "partial_completion": {"type": "number", "minimum": 0, "maximum": 1},
+        "quality": {"type": "number", "minimum": 1, "maximum": 10},
+        "satisfaction": {"type": "number", "minimum": 1, "maximum": 10},
+        "would_repeat": {"type": "boolean"},
+        "barriers_encountered": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "facilitators": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "What helped make this happen"
+        }
+      }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "default": 1.0
+    },
+    "source": {
+      "type": "string",
+      "enum": ["manual", "imported", "inferred", "device", "conversation"],
+      "default": "manual"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

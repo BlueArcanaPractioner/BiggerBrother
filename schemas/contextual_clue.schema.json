@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "contextual_clue.schema.json",
+  "title": "Contextual Clue",
+  "description": "Evidence that may indicate future or ongoing activity",
+  "type": "object",
+  "required": ["id", "timestamp", "clue_type", "content", "potential_activities", "source_message_id"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "clue_type": {
+      "type": "string",
+      "enum": ["direct_mention", "contextual_clue", "temporal_marker", "completion_signal", "planning_signal", "duration_clue"]
+    },
+    "content": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "potential_activities": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": [
+          {"type": "string"},
+          {"type": "number", "minimum": 0.0, "maximum": 1.0}
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "source_message_id": {
+      "type": "string"
+    },
+    "decay_rate": {
+      "type": "number",
+      "default": 0.95
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/label_record.schema.json",
+  "title": "LabelRecord v0.1.0",
+  "type": "object",
+  "required": ["gid", "topic", "tone", "intent", "confidence"],
+  "properties": {
+    "gid": { "type": "string", "minLength": 1 },
+
+    "topic": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/labelScore" },
+      "uniqueItems": true,
+      "$comment": "Arrays MUST be sorted by p (descending). Tests enforce this. Labels should be unique by `label`."
+    },
+    "tone": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/labelScore" },
+      "uniqueItems": true,
+      "$comment": "Arrays MUST be sorted by p (descending). Tests enforce this. Labels should be unique by `label`."
+    },
+    "intent": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/labelScore" },
+      "uniqueItems": true,
+      "$comment": "Arrays MUST be sorted by p (descending). Tests enforce this. Labels should be unique by `label`."
+    },
+
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "$comment": "Set to 0 when the message has no taggable text; excluded from coverage in tests."
+    }
+  },
+  "additionalProperties": false,
+
+  "$defs": {
+    "labelScore": {
+      "type": "object",
+      "required": ["label", "p"],
+      "properties": {
+        "label": { "type": "string", "minLength": 1 },
+        "p":     { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "additionalProperties": false
+    }
+  },
+
+  "examples": [
+    {
+      "gid": "conv#000123",
+      "topic":  [ { "label": "mtg_ai", "p": 0.62 }, { "label": "worldbuilding", "p": 0.28 } ],
+      "tone":   [ { "label": "reflective", "p": 0.71 } ],
+      "intent": [ { "label": "plan_next_steps", "p": 0.54 }, { "label": "vent", "p": 0.31 } ],
+      "confidence": 0.66
+    }
+  ]
+}

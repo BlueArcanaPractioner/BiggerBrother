@@ -1,0 +1,67 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "profile_fact.schema.json",
+    "title": "Profile Fact",
+    "description": "A fact about the user extracted from conversations",
+    "type": "object",
+    "required": ["id", "category", "key", "value", "confidence", "privacy_level", "first_observed", "last_confirmed"],
+    "properties": {
+      "id": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{16}$",
+        "description": "16-character hex ID"
+      },
+      "category": {
+        "type": "string",
+        "enum": ["employment", "health", "relationships", "routines", "preferences", "activities", "skills", "goals", "context"]
+      },
+      "key": {
+        "type": "string",
+        "description": "Fact key (e.g., 'employer', 'wake_time', 'medication')"
+      },
+      "value": {
+        "oneOf": [
+          {"type": "string"},
+          {"type": "number"},
+          {"type": "boolean"},
+          {"type": "object"}
+        ],
+        "description": "Fact value (anonymized if contains third-party info)"
+      },
+      "confidence": {
+        "type": "number",
+        "minimum": 0.0,
+        "maximum": 1.0
+      },
+      "privacy_level": {
+        "type": "string",
+        "enum": ["public", "personal", "sensitive", "third_party"]
+      },
+      "source_messages": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Message IDs that support this fact"
+      },
+      "first_observed": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "last_confirmed": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "update_count": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "supersedes": {
+        "type": "string",
+        "description": "ID of previous fact this replaces"
+      },
+      "expires_at": {
+        "type": "string",
+        "format": "date-time",
+        "description": "When this fact expires (for temporary facts)"
+      }
+    }
+  }

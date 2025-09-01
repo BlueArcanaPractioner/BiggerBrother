@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/chunk_record.schema.json",
+  "title": "ChunkRecord",
+  "type": "object",
+  "required": ["gid", "role", "content_text"],
+  "properties": {
+    "gid": { "type": "string" },
+    "role": { "type": "string", "enum": ["user", "assistant", "system", "tool"] },
+    "content_text": { "type": "string" },
+    "ts": { "type": "string", "format": "date-time" },
+    "model": { "type": "string" }
+  },
+  "additionalProperties": true
+}

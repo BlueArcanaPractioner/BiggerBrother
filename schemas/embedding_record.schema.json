@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/embedding_record.schema.json",
+  "title": "Embedding Record",
+  "description": "Schema for text embeddings and similarity computations used in label harmonization",
+  "type": "object",
+  "required": ["text", "embedding", "model", "timestamp"],
+  "additionalProperties": false,
+  "properties": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The original text that was embedded"
+    },
+    "embedding": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "minItems": 1,
+      "description": "The embedding vector"
+    },
+    "model": {
+      "type": "string",
+      "enum": ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"],
+      "description": "The embedding model used"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the embedding was generated"
+    },
+    "similarity_threshold": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "default": 0.92,
+      "description": "Threshold for considering embeddings similar"
+    },
+    "merge_group": {
+      "type": "string",
+      "description": "Canonical label this embedding was merged into"
+    },
+    "similarity_scores": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number",
+        "minimum": -1.0,
+        "maximum": 1.0
+      },
+      "description": "Cosine similarity scores with other embeddings"
+    }
+  }
+}

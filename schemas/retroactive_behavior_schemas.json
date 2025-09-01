@@ -1,0 +1,348 @@
+{
+  "inferred_activity": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "inferred_activity.schema.json",
+    "title": "Inferred Activity",
+    "description": "Activity inferred from conversation analysis",
+    "type": "object",
+    "required": ["id", "timestamp", "category", "confidence", "source"],
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "UUID for the inferred activity"
+      },
+      "timestamp": {
+        "type": "string",
+        "format": "date-time",
+        "description": "When the activity likely occurred"
+      },
+      "timestamp_precision": {
+        "type": "string",
+        "enum": ["exact", "hour", "morning", "afternoon", "evening", "day"],
+        "description": "How precise the timestamp inference is"
+      },
+      "category": {
+        "type": "string",
+        "enum": [
+          "work_session",
+          "meeting",
+          "meal",
+          "exercise",
+          "sleep",
+          "commute",
+          "social",
+          "entertainment",
+          "personal_care",
+          "household",
+          "shopping",
+          "medical",
+          "learning",
+          "creative",
+          "break",
+          "planning",
+          "other"
+        ]
+      },
+      "activity": {
+        "type": "string",
+        "description": "Specific activity within category (e.g., 'team standup', 'grocery shopping')"
+      },
+      "duration_minutes": {
+        "type": "number",
+        "description": "Estimated or inferred duration in minutes"
+      },
+      "duration_confidence": {
+        "type": "number",
+        "minimum": 0.0,
+        "maximum": 1.0
+      },
+      "crystallized_from": {
+        "type": "string",
+        "description": "Hypothesis ID if crystallized"
+      },
+      "evidence_trail": {
+        "type": "array",
+        "items": {"type": "string"}
+      },
+      "confidence": {
+        "type": "number",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "description": "Confidence in this inference"
+      },
+      "source": {
+        "type": "object",
+        "required": ["type", "message_ids"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["explicit_mention", "implicit_reference", "temporal_inference", "suggestion_response", "context_clue"]
+          },
+          "message_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Messages that led to this inference"
+          },
+          "key_phrases": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Phrases that triggered the inference"
+          }
+        }
+      },
+      "notes": {
+        "type": "string",
+        "description": "Any specific details mentioned by user"
+      },
+      "completed": {
+        "type": "boolean",
+        "description": "Whether the activity was completed or just planned"
+      },
+      "sentiment": {
+        "type": "string",
+        "enum": ["positive", "neutral", "negative", "mixed"],
+        "description": "User's sentiment about the activity"
+      },
+      "participants": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Other people involved (if mentioned)"
+      },
+      "location": {
+        "type": "string",
+        "description": "Where the activity took place (if mentioned)"
+      },
+      "supersedes": {
+        "type": "string",
+        "description": "ID of lower-confidence inference this replaces"
+      },
+      "metadata": {
+        "type": "object",
+        "properties": {
+          "weather": {"type": "string"},
+          "day_of_week": {"type": "string"},
+          "is_holiday": {"type": "boolean"},
+          "energy_level": {"type": "number"},
+          "stress_level": {"type": "number"}
+        }
+      }
+    }
+  },
+  
+  "activity_timeline": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "activity_timeline.schema.json",
+    "title": "Activity Timeline",
+    "description": "Reconstructed timeline of user's day/week",
+    "type": "object",
+    "required": ["id", "date_range", "activities", "confidence_score"],
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "date_range": {
+        "type": "object",
+        "required": ["start", "end"],
+        "properties": {
+          "start": {"type": "string", "format": "date-time"},
+          "end": {"type": "string", "format": "date-time"}
+        }
+      },
+      "activities": {
+        "type": "array",
+        "items": {"$ref": "#/definitions/timelineEntry"}
+      },
+      "confidence_score": {
+        "type": "number",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "description": "Overall confidence in timeline accuracy"
+      },
+      "gaps": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "start": {"type": "string", "format": "date-time"},
+            "end": {"type": "string", "format": "date-time"},
+            "likely_activity": {"type": "string"}
+          }
+        },
+        "description": "Time periods with no inferred activities"
+      },
+      "patterns": {
+        "type": "object",
+        "properties": {
+          "wake_time": {"type": "string", "format": "time"},
+          "sleep_time": {"type": "string", "format": "time"},
+          "meal_times": {
+            "type": "array",
+            "items": {"type": "string", "format": "time"}
+          },
+          "work_hours": {
+            "type": "object",
+            "properties": {
+              "start": {"type": "string", "format": "time"},
+              "end": {"type": "string", "format": "time"}
+            }
+          }
+        }
+      },
+      "summary_stats": {
+        "type": "object",
+        "properties": {
+          "total_activities": {"type": "integer"},
+          "categories": {
+            "type": "object",
+            "additionalProperties": {"type": "integer"}
+          },
+          "avg_confidence": {"type": "number"},
+          "coverage_percentage": {"type": "number"}
+        }
+      }
+    },
+    "definitions": {
+      "timelineEntry": {
+        "type": "object",
+        "required": ["activity_id", "timestamp", "category"],
+        "properties": {
+          "activity_id": {"type": "string"},
+          "timestamp": {"type": "string", "format": "date-time"},
+          "category": {"type": "string"},
+          "activity": {"type": "string"},
+          "duration_minutes": {"type": "number"},
+          "confidence": {"type": "number"},
+          "overlaps_with": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "IDs of potentially overlapping activities"
+          }
+        }
+      }
+    }
+  },
+  
+  "inference_rules": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "inference_rules.schema.json",
+    "title": "Inference Rules",
+    "description": "Rules for inferring activities from messages",
+    "type": "object",
+    "required": ["rules"],
+    "properties": {
+      "rules": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["id", "category", "patterns", "confidence_modifier"],
+          "properties": {
+            "id": {"type": "string"},
+            "category": {"type": "string"},
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": ["keyword", "phrase", "temporal", "response", "context"]
+                  },
+                  "pattern": {"type": "string"},
+                  "confidence_boost": {"type": "number"}
+                }
+              }
+            },
+            "confidence_modifier": {"type": "number"},
+            "temporal_hints": {
+              "type": "object",
+              "properties": {
+                "typical_time": {"type": "string"},
+                "typical_duration": {"type": "number"},
+                "day_parts": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": ["early_morning", "morning", "midday", "afternoon", "evening", "night", "late_night"]
+                  }
+                }
+              }
+            },
+            "context_requirements": {
+              "type": "array",
+              "items": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  },
+  
+  "conversation_context": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "$id": "conversation_context.schema.json",
+    "title": "Conversation Context Window",
+    "description": "Sliding window of conversation for analysis",
+    "type": "object",
+    "required": ["window_id", "messages", "timespan"],
+    "properties": {
+      "window_id": {"type": "string"},
+      "messages": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["id", "timestamp", "sender", "content"],
+          "properties": {
+            "id": {"type": "string"},
+            "timestamp": {"type": "string", "format": "date-time"},
+            "sender": {
+              "type": "string",
+              "enum": ["user", "assistant", "system"]
+            },
+            "content": {"type": "string"},
+            "extracted_info": {
+              "type": "object",
+              "properties": {
+                "activities_mentioned": {
+                  "type": "array",
+                  "items": {"type": "string"}
+                },
+                "temporal_markers": {
+                  "type": "array",
+                  "items": {"type": "string"}
+                },
+                "completion_indicators": {
+                  "type": "array",
+                  "items": {"type": "string"}
+                },
+                "rejection_indicators": {
+                  "type": "array",
+                  "items": {"type": "string"}
+                }
+              }
+            }
+          }
+        }
+      },
+      "timespan": {
+        "type": "object",
+        "properties": {
+          "start": {"type": "string", "format": "date-time"},
+          "end": {"type": "string", "format": "date-time"},
+          "duration_hours": {"type": "number"}
+        }
+      },
+      "inferred_context": {
+        "type": "object",
+        "properties": {
+          "user_state": {
+            "type": "string",
+            "enum": ["working", "resting", "active", "socializing", "planning", "reflecting"]
+          },
+          "location": {"type": "string"},
+          "mood": {"type": "string"},
+          "energy_level": {"type": "number"}
+        }
+      }
+    }
+  }
+}

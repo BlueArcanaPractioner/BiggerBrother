@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/module_spec_item.schema.json",
+  "title": "ModuleSpecItem",
+  "type": "object",
+  "required": [
+    "name",
+    "language",
+    "description",
+    "public",
+    "inputs",
+    "outputs",
+    "target_path",
+    "acceptance"
+  ],
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "language": { "type": "string", "enum": ["python"] },
+    "description": { "type": "string" },
+    "public": {
+      "title": "Public API signatures",
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "inputs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 0
+    },
+    "outputs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 0
+    },
+    "target_path": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_\\-./]+\\.py$"
+    },
+    "constraints": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "acceptance": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "schemas": {
+      "type": "object",
+      "properties": {
+        "input": { "$ref": "https://json-schema.org/draft/2020-12/schema" },
+        "output": { "$ref": "https://json-schema.org/draft/2020-12/schema" }
+      },
+      "additionalProperties": false
+    },
+    "examples": {
+      "type": "object",
+      "properties": {
+        "input": {},
+        "output": {},
+        "harness": {}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

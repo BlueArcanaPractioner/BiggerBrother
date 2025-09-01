@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "node.schema.json",
+  "title": "Graph Node",
+  "description": "A node in the personal knowledge graph",
+  "type": "object",
+  "required": ["id", "type", "created_at"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "UUID for the node",
+      "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+    },
+    "type": {
+      "type": "string",
+      "description": "Node type",
+      "enum": ["thought", "note", "log", "task", "goal", "person", "concept", "reference"]
+    },
+    "text": {
+      "type": "string",
+      "description": "Main content of the node"
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_-]+$"
+      },
+      "description": "Tags for categorization and search"
+    },
+    "attrs": {
+      "type": "object",
+      "description": "Additional attributes specific to node type",
+      "additionalProperties": true
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp"
+    }
+  }
+}

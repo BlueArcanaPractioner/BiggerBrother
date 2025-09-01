@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/plan_h1_module.schema.json",
+  "title": "PlanH1Module",
+  "type": "object",
+  "required": ["schema_version", "module", "purpose", "inputs", "outputs", "acceptance"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "module": { "type": "string", "minLength": 1 },
+    "purpose": { "type": "string", "minLength": 1 },
+    "inputs": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "required": ["name", "type"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "type": "string" },
+              "fields": { "type": "array"},
+              "items": {},
+              "description": {"type":  "string"}
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "outputs": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "required": ["name", "type"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "type": "string" },
+              "fields": { "type": "array"},
+              "items": {},
+              "description": {"type":  "string"}
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "edge_cases": {
+      "type": "array",
+      "minItems": 0,
+      "itens": {
+        "oneOf": [
+          {"type": "string"},
+          {
+            "type": "object",
+            "required": ["description"],
+            "properties": {
+              "description": {"type":  "string"},
+              "handling": {"type":  "string"}
+            },
+            "additionalProperties": true
+          }
+        ]
+      }
+    },
+    "schema_sketches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "fields"],
+        "properties": {
+          "name": { "type": "string" },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "type"],
+              "properties": {
+                "name": { "type": "string" },
+                "type": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "acceptance": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    }
+  },
+  "additionalProperties": false
+}
