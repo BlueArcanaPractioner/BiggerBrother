@@ -40,6 +40,7 @@ from assistant.importers.enhanced_smart_label_importer import EnhancedLabelHarmo
 # Import all our new components
 from assistant.behavioral_engine.features.enhanced_feature_extraction import EnhancedFeatureExtractor
 from assistant.behavioral_engine.gamification.rpg_system import RPGSystem
+from assistant.behavioral_engine.context.similarity_matcher import ContextSimilarityMatcher
 from assistant.behavioral_engine.routines.routine_builder import RoutineBuilder
 from assistant.behavioral_engine.logbooks.dynamic_logbook_system import (
     DynamicLogBook,
@@ -251,6 +252,13 @@ class CompleteIntegratedSystem:
         self.labels_created_count = 0
         self.last_harmonization_count = 0
 
+        self.context_matcher = ContextSimilarityMatcher(
+            labels_dir=labels_dir,
+            chunks_dir=chunks_dir,
+            harmonization_dir=harmonizer_dir,
+            openai_client=self.openai_client
+        )
+
         print(f"✅ Complete Integrated System initialized")
         if use_config:
             print(f"   Using centralized configuration")
@@ -276,47 +284,13 @@ class CompleteIntegratedSystem:
     # ==================== NEW TWO-TIER CONTEXT METHODS ====================
 
     def get_similar_messages_for_context(self, current_labels: Dict[str, List[Dict]], limit: int = 10) -> List[str]:
-        """
-        Find similar messages based on label similarity using probabilities.
-        Uses the harmonizer's similarity scoring with probability weights.
-        """
-        similar_messages = []
-
-        # Get recent messages from graph
-        recent_nodes = self.graph.get_recent_nodes(hours=168, node_type="log", limit=100)
-
-        # Score each message based on label similarity
-        scored_messages = []
-
-        for node in recent_nodes:
-            if 'attrs' not in node:
-                continue
-
-            attrs = node['attrs']
-            total_score = 0.0
-
-            # Calculate similarity for each category
-            for category in ['topic', 'tone', 'intent']:
-                if category in current_labels and category in attrs:
-                    score = self.harmonizer.get_label_similarity_scores(
-                        current_labels[category],
-                        attrs.get(category, []),
-                        category
-                    )
-                    total_score += score
-
-            if total_score > 0:
-                scored_messages.append((total_score, node))
-
-        # Sort by score and take top messages
-        scored_messages.sort(key=lambda x: x[0], reverse=True)
-
-        for score, node in scored_messages[:limit]:
-            text = node.get('text', '')
-            if text:
-                similar_messages.append(text)
-
-        return similar_messages
+        # Delegate to the new matcher
+        context_messages, metadata = self.context_matcher.find_similar_messages(
+            message="",  # We already have labels, could refactor this
+            min_chars_recent=10000,
+            min_chars_long_term=50000
+        )
+        return [msg["content"] for msg in context_messages[:limit]]
 
     def select_context_categories_by_labels(self, harmonized_labels: Dict) -> Tuple[List[str], int, int]:
         """
