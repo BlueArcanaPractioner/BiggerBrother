@@ -15,10 +15,14 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict
 import numpy as np
+import tempfile, pickle
+
+from pydantic_core.core_schema import none_schema
 
 from app.openai_client import OpenAIClient
 from app.label_integration_wrappers import LabelGenerator
 from assistant.importers.enhanced_smart_label_importer import EnhancedLabelHarmonizer
+
 
 
 class ContextSimilarityMatcher:
@@ -129,13 +133,26 @@ class ContextSimilarityMatcher:
                     self.embedding_cache = pickle.load(f)
             except:
                 self.embedding_cache = {}
-    
+
     def _save_embedding_cache(self):
-        """Save embedding cache."""
+        """Save embedding cache atomically."""
         cache_file = self.harmonization_dir / "embedding_cache.pkl"
-        import pickle
-        with open(cache_file, 'wb') as f:
-            pickle.dump(self.embedding_cache, f)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+
+        fd, tmp_path = tempfile.mkstemp(
+            dir=cache_file.parent, prefix=cache_file.name, suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(self.embedding_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, cache_file)  # atomic on same filesystem
+        finally:
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
     
     def get_message_labels(self, message: str) -> Dict:
         """
@@ -230,6 +247,46 @@ class ContextSimilarityMatcher:
                     data["score"] = avg_prob * data["count"]
         
         return harmonized
+
+    def _specifics_under_general(self, category: str, general_canon: str) -> set[str]:
+        """
+        Collect the set of specific canonical labels that live under a given general group.
+        We derive it by mapping that general group's member *variants* through self._canon_map.
+        """
+        variants = (self.general_groups.get(category, {})
+                    .get("groups", {})
+                    .get(general_canon, []))
+        allowed = set()
+        cmap = self._canon_map.get(category, {})
+        for raw in variants:
+            spec, _gen = cmap.get(raw, (None, None))
+            if spec:
+                allowed.add(spec)
+        return allowed
+
+    def _find_best_specific_within(self, label: str, category: str, general_canon: str) -> str | None:
+        """
+        Use your _find_best_group but restricted to specifics that belong to the chosen general.
+        We do this by temporarily filtering the group dict to the allowed specific canonicals.
+        """
+        allowed = self._specifics_under_general(category, general_canon)
+        if not allowed:
+            return None
+
+        # clone a minimal view of specific groups limited to `allowed`
+        groups_all = self.specific_groups.get(category, {}).get("groups", {})
+        orig = groups_all  # keep a handle
+
+        # build a restricted dict: only allowed canonicals
+        restricted = {k: v for k, v in groups_all.items() if k in allowed}
+
+        # temporarily swap just for this call
+        self.specific_groups[category]["groups"] = restricted
+        try:
+            return self._find_best_group(label, category, "specific")
+        finally:
+            # restore full view
+            self.specific_groups[category]["groups"] = orig
     
     def _find_best_group(self, label: str, category: str, tier: str) -> Optional[str]:
         """
@@ -282,37 +339,26 @@ class ContextSimilarityMatcher:
     
         
     def _get_embedding(self, text: str) -> Optional[np.ndarray]:
-    
-        """Get embedding for text, using cache when possible."""
-    
-        if text in self.embedding_cache:
-    
-            return np.array(self.embedding_cache[text])
-    
-        
-    
-        # Use the harmonizer's embedding functionality if available
-    
-        if self.harmonizer:
-    
-            try:
-    
-                embedding = self.harmonizer._get_embedding(text)
-    
-                if embedding is not None:
-    
-                    return embedding
-    
-            except Exception as e:
-    
-                print(f"Harmonizer embedding failed: {e}")
-    
-        
-    
-        # Fall back to simulated embedding
-    
-        return self._simulated_embedding(text)
-    
+        """
+        Return embedding for 'test', populating and PERSISTING the cache on miss.
+        """
+
+        vec = self.embedding_cache.get(text)
+        if vec is not None:
+            return vec
+        vec = self.harmonizer._get_embedding(text)
+        if vec is None:
+            return None
+        self.embedding_cache[text] = vec
+
+        try:
+            self._save_embedding_cache()
+        except Exception as e:
+            if hasattr(self, "logger"):
+                self.logger.warning(f"embedding cache save failed: {e}")
+            else:
+                print(f"[warn] embedding cache save failed: {e}")
+        return vec
     
     
     def _simulated_embedding(self, text: str) -> np.ndarray:
@@ -446,124 +492,333 @@ class ContextSimilarityMatcher:
                     total_score += overlap_score
         
         return total_score
-    
+
+    def _load_two_tier_maps(self) -> None:
+        """
+        Build raw->(specific, general) maps from precomputed harmonization files.
+        Idempotent and cheap; cache on self.
+        """
+        if getattr(self, "_canon_map", None) is not None:
+            return
+
+        data_dir = getattr(self, "data_dir", Path("data"))
+        general_path = Path(data_dir) / "harmonization_general.json"
+        specific_path = Path(data_dir) / "harmonization_specific.json"
+
+        with open(general_path, "r") as f:
+            general = json.load(f)
+        with open(specific_path, "r") as f:
+            specific = json.load(f)
+
+        canon_map: Dict[str, Dict[str, Tuple[str, str]]] = {
+            "topic": {}, "tone": {}, "intent": {}
+        }
+
+        # Invert specific groups first (higher precision)
+        for cat in ("topic", "tone", "intent"):
+            for canonical, members in specific[cat]["groups"].items():
+                for m in members:
+                    # default general=canonical; fix below if broader group exists
+                    canon_map[cat][m] = (canonical, canonical)
+
+        # Fill/override general group second (broader umbrella)
+        for cat in ("topic", "tone", "intent"):
+            for canonical, members in general[cat]["groups"].items():
+                for m in members:
+                    spec, gen = canon_map[cat].get(m, (m, canonical))
+                    canon_map[cat][m] = (spec, canonical)
+
+        self._canon_map = canon_map
+
+    def _canonicalize_label_list(self, raw_list, category: str, tier: str = "specific") -> dict[str, float]:
+        out: dict[str, float] = {}
+        cmap = self._canon_map.get(category, {})
+
+        for item in (raw_list or []):
+            raw = item.get("label") or item.get("text") or ""
+            if not raw:
+                continue
+            p = float(item.get("p", item.get("probability", 1.0)))
+            p = 0.0 if p < 0 else (1.0 if p > 1.0 else p)
+
+            if raw in cmap:
+                spec, gen = cmap[raw]
+            else:
+                # reuse your helper(s), no new logic
+                gen = self._find_best_group(raw, category, "general")
+                spec = self._find_best_specific_within(raw, category, gen) if gen else None
+                # fallbacks that keep us moving
+                if spec is None and gen is not None:
+                    spec = raw  # unknown specific under known general
+                if gen is None:
+                    gen = spec or raw  # keep it self-contained
+
+            key = spec if tier == "specific" else gen
+            if key:
+                out[key] = max(out.get(key, 0.0), p)
+
+        return out
+
+    def _weighted_jaccard(self, a: Dict[str, float], b: Dict[str, float]) -> float:
+        """
+        Weighted Jaccard over canonical labels.
+        Intersection uses min(p), union uses max(p).
+        """
+        if not a or not b:
+            return 0.0
+        keys = set(a) | set(b)
+        inter = sum(min(a.get(k, 0.0), b.get(k, 0.0)) for k in keys)
+        union = sum(max(a.get(k, 0.0), b.get(k, 0.0)) for k in keys)
+        return inter / union if union > 0 else 0.0
+
+    def _coerce_ts(self, label_path, label_obj, now_utc: datetime) -> datetime:
+        """
+        Try, in order:
+          1) label_obj timestamp fields (ISO or epoch s/ms)
+          2) filename prefix YYYYMMDD
+          3) file mtime
+          4) fallback: now - 7 days
+        Return a timezone-aware UTC datetime.
+        """
+        # 1) Look for common fields in the label payload
+        for key in ("timestamp", "ts", "created_at"):
+            ts = label_obj.get(key)
+            if ts is None:
+                continue
+            # epoch seconds or ms
+            if isinstance(ts, (int, float)):
+                # ms if it looks too big
+                if ts > 1e12:
+                    ts = ts / 1000.0
+                try:
+                    return datetime.fromtimestamp(ts, tz=timezone.utc)
+                except Exception:
+                    pass
+            # ISO 8601 strings (including trailing 'Z')
+            if isinstance(ts, str):
+                try:
+                    s = ts.strip()
+                    # Accept 'Z' and no-tz forms
+                    if s.endswith("Z"):
+                        s = s[:-1] + "+00:00"
+                    dt = datetime.fromisoformat(s)
+                    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    pass
+
+        # 2) Try filename prefix YYYYMMDD
+        try:
+            stem = getattr(label_path, "stem", str(label_path))
+            ymd = stem.split("_")[0]
+            dt = datetime.strptime(ymd, "%Y%m%d").replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            pass
+
+        # 3) File mtime (best-effort)
+        try:
+            mtime = os.path.getmtime(label_path)
+            return datetime.fromtimestamp(mtime, tz=timezone.utc)
+        except Exception:
+            pass
+
+        # 4) Fallback: pretend it's a week old
+        from datetime import timedelta
+        return now_utc - timedelta(days=7)
+
     def find_similar_messages(
-        self,
-        message: str,
-        min_chars_recent: Optional[int] = None,
-        min_chars_long_term: Optional[int] = None
+            self,
+            message: str,
+            min_chars_recent: Optional[int] = None,
+            min_chars_long_term: Optional[int] = None,
     ) -> Tuple[List[Dict], Dict]:
         """
-        Find similar messages and build context.
-        
-        Args:
-            message: Current message to find context for
-            min_chars_recent: Override for recent context minimum
-            min_chars_long_term: Override for long-term context minimum
-            
-        Returns:
-            Tuple of (context_messages, metadata)
+        Build context using precomputed two-tier harmonization.
+        No embedding API calls in the scan; optional cosine blend uses cached vectors only.
         """
+        # budgets
         min_chars_recent = min_chars_recent or self.context_minimum_char_recent
         min_chars_long_term = min_chars_long_term or self.context_minimum_char_long_term
-        
-        # Get and harmonize labels for current message
+
+        # Setup
+        self._load_two_tier_maps()
+        now = datetime.now(timezone.utc)
+
+        # Current labels → canonical (specific)
         current_labels = self.get_message_labels(message)
-        current_harmonized = self.harmonize_and_score_labels(current_labels)
-        
-        # Create new chunk and label files for the message
+        cur_topics = self._canonicalize_label_list(current_labels.get("topic", []), "topic", tier="specific")
+        cur_tones = self._canonicalize_label_list(current_labels.get("tone", []), "tone", tier="specific")
+        cur_intents = self._canonicalize_label_list(current_labels.get("intent", []), "intent", tier="specific")
+
+        # Create files for current message
         chunk_file, label_file = self._create_message_files(message, current_labels)
-        
-        # Find all existing labels and calculate similarities
-        similarities = []
-        
+        try:
+            with open(label_file, "r", encoding="utf-8") as _f:
+                _new_gid = (json.load(_f) or {}).get("gid")
+        except Exception:
+            _new_gid = None
+
+        # General-tier sets for quick overlap gate
+        cur_gen_topic = set(
+            self._canonicalize_label_list(current_labels.get("topic", []), "topic", tier="general").keys())
+        cur_gen_tone = set(self._canonicalize_label_list(current_labels.get("tone", []), "tone", tier="general").keys())
+        cur_gen_intent = set(
+            self._canonicalize_label_list(current_labels.get("intent", []), "intent", tier="general").keys())
+
+        # Optional cosine blend from cached embeddings (no API)
+        use_embed_blend = getattr(self, "use_embedding_blend", False) and hasattr(self, "embedding_cache")
+        embed_weight = float(getattr(self, "embed_blend_weight", 0.6))
+        embed_weight = 0.0 if not use_embed_blend else max(0.0, min(1.0, embed_weight))
+
+        def _cat_vec(canon: Dict[str, float]) -> Optional[List[float]]:
+            if not use_embed_blend:
+                return None
+            acc = None
+            for lab, w in canon.items():
+                v = self.embedding_cache.get(lab)
+                if v is None:
+                    continue
+                acc = [w * x for x in v] if acc is None else [a + w * x for a, x in zip(acc, v)]
+            if acc is None:
+                return None
+            import math
+            n = math.sqrt(sum(a * a for a in acc)) or 0.0
+            return [a / n for a in acc] if n > 0 else None
+
+        def _cos(u: Optional[List[float]], v: Optional[List[float]]) -> float:
+            if u is None or v is None:
+                return 0.0
+            return float(sum(a * b for a, b in zip(u, v)))
+
+        # Precompute current vectors once (only if blending)
+        _cur_v_topic = _cat_vec(cur_topics)
+        _cur_v_tone = _cat_vec(cur_tones)
+        _cur_v_intent = _cat_vec(cur_intents)
+
+        similarities: List[Dict] = []
         for label_file_path in self.labels_dir.glob("*.json"):
             try:
-                with open(label_file_path, 'r') as f:
+                with open(label_file_path, "r", encoding="utf-8") as f:
                     target_labels = json.load(f)
-                
-                # Skip if no gid
                 gid = target_labels.get("gid")
                 if not gid:
                     continue
-                
-                # Get timestamp from filename or label
-                timestamp_str = label_file_path.stem.split("_")[0]
+                if _new_gid and gid == _new_gid:
+                    continue
+
+                # Timestamp: try filename, then label fields, then file mtime, else ~7d ago
+                ts_str = label_file_path.stem.split("_")[0]
                 try:
-                    timestamp = datetime.strptime(timestamp_str, "%Y%m%d")
-                    timestamp = timestamp.replace(tzinfo=timezone.utc)
-                except:
-                    timestamp = datetime.now(timezone.utc) - timedelta(days=7)
-                
-                # Harmonize target labels
-                target_harmonized = self.harmonize_and_score_labels(target_labels)
-                
-                # Calculate similarity
-                similarity = self.calculate_similarity_score(
-                    current_harmonized,
-                    target_harmonized,
-                    timestamp
-                )
-                
-                if similarity > 0:
+                    ts = datetime.strptime(ts_str, "%Y%m%d").replace(tzinfo=timezone.utc)
+                except Exception:
+                    ts = target_labels.get("timestamp")
+                    if isinstance(ts, str):
+                        try:
+                            ts = datetime.fromisoformat(ts)
+                        except Exception:
+                            ts = None
+                    if not isinstance(ts, datetime):
+                        ts = self._coerce_ts(label_file_path, target_labels, now)
+
+                # General-tier overlap gate
+                tgt_gen_topic = set(
+                    self._canonicalize_label_list(target_labels.get("topic", []), "topic", tier="general").keys())
+                tgt_gen_tone = set(
+                    self._canonicalize_label_list(target_labels.get("tone", []), "tone", tier="general").keys())
+                tgt_gen_intent = set(
+                    self._canonicalize_label_list(target_labels.get("intent", []), "intent", tier="general").keys())
+                if not (
+                        cur_gen_topic & tgt_gen_topic or cur_gen_tone & tgt_gen_tone or cur_gen_intent & tgt_gen_intent):
+                    continue
+
+                # Target canonical (specific)
+                tgt_topics = self._canonicalize_label_list(target_labels.get("topic", []), "topic", tier="specific")
+                tgt_tones = self._canonicalize_label_list(target_labels.get("tone", []), "tone", tier="specific")
+                tgt_intents = self._canonicalize_label_list(target_labels.get("intent", []), "intent", tier="specific")
+
+                # Weighted Jaccard
+                w_topic, w_tone, w_intent = 0.5, 0.2, 0.3
+                s_topic = self._weighted_jaccard(cur_topics, tgt_topics)
+                s_tone = self._weighted_jaccard(cur_tones, tgt_tones)
+                s_intent = self._weighted_jaccard(cur_intents, tgt_intents)
+                sim = w_topic * s_topic + w_tone * s_tone + w_intent * s_intent
+
+                # Optional cached-embedding cosine blend (applied once)
+                if embed_weight > 0.0 and (_cur_v_topic or _cur_v_tone or _cur_v_intent):
+                    tgt_v_topic = _cat_vec(tgt_topics)
+                    tgt_v_tone = _cat_vec(tgt_tones)
+                    tgt_v_intent = _cat_vec(tgt_intents)
+                    cos_score = (
+                            w_topic * _cos(_cur_v_topic, tgt_v_topic) +
+                            w_tone * _cos(_cur_v_tone, tgt_v_tone) +
+                            w_intent * _cos(_cur_v_intent, tgt_v_intent)
+                    )
+                    sim = (1.0 - embed_weight) * sim + embed_weight * cos_score
+
+                if sim > 0.0:
                     similarities.append({
                         "gid": gid,
-                        "similarity": similarity,
-                        "timestamp": timestamp,
-                        "label_file": label_file_path.name
+                        "similarity": float(sim),
+                        "timestamp": ts,
+                        "label_file": label_file_path.name,
                     })
-            
+                    if getattr(self, "debug_similarity", False):
+                        print(f"[ctx] {gid} sim={sim:.4f}")
+
             except Exception as e:
-                print(f"Error processing {label_file_path}: {e}")
+                print(f"[ctx] Error processing {label_file_path}: {e}")
                 continue
-        
-        # Sort by similarity
+
+        # Sort & build context within budgets
         similarities.sort(key=lambda x: x["similarity"], reverse=True)
-        
-        # Build context by adding messages until we hit limits
-        context_messages = []
-        total_chars = 0
-        max_total_chars = min_chars_recent + min_chars_long_term  # Use as total limit
 
-        # Add ALL messages with similarity > threshold, sorted by similarity
-        for item in similarities:  # No artificial limit on number of messages
-            # Load the chunk for this gid
-            chunk_content = self._load_chunk_by_gid(item["gid"])
-            if not chunk_content:
-                continue
+        context_messages: List[Dict] = []
+        recent_chars = 0
+        long_chars = 0
 
-            content_text = chunk_content.get("content_text", "")
-            content_length = len(content_text)
+        for item in similarities:
+            chunk_content = self._load_chunk_by_gid(item["gid"]) or {}
+            text = chunk_content.get("content_text", "") or ""
+            L = len(text)
+            is_recent = (now - item["timestamp"]).days <= 7
 
-            # Stop if adding this would exceed our total character limit
-            if total_chars + content_length > max_total_chars:
-                break
-
-            # Determine if this is recent (within 7 days)
-            is_recent = (datetime.now(timezone.utc) - item["timestamp"]).days <= 7
+            if is_recent:
+                if recent_chars + L > min_chars_recent:
+                    continue
+                recent_chars += L
+            else:
+                if long_chars + L > min_chars_long_term:
+                    continue
+                long_chars += L
 
             context_messages.append({
                 "gid": item["gid"],
-                "content": content_text,
+                "content": text,
                 "similarity": item["similarity"],
                 "timestamp": item["timestamp"].isoformat(),
-                "is_recent": is_recent
+                "is_recent": is_recent,
             })
-            total_chars += content_length
-        
+
+            if recent_chars >= min_chars_recent and long_chars >= min_chars_long_term:
+                break
+
         metadata = {
             "current_labels": current_labels,
-            "current_harmonized": current_harmonized,
+            "current_canonical": {
+                "topic": cur_topics, "tone": cur_tones, "intent": cur_intents
+            },
             "total_similarities_found": len(similarities),
             "context_messages_included": len(context_messages),
-            "recent_chars": total_chars,
-            "long_term_chars": total_chars,
+            "recent_chars": recent_chars,
+            "long_term_chars": long_chars,
             "chunk_file": chunk_file,
-            "label_file": label_file
+            "label_file": label_file,
+            "stopped_due_to": "char_budget" if (
+                    recent_chars >= min_chars_recent and long_chars >= min_chars_long_term
+            ) else "exhausted_candidates",
         }
-        
         return context_messages, metadata
-    
+
     def _create_message_files(self, message: str, labels: Dict) -> Tuple[str, str]:
         """
         Create chunk and label files for a new message.

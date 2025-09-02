@@ -98,52 +98,86 @@ class GmailIntegration:
         print(f"✅ Gmail connected: {self.email_address}")
 
     def get_unread_messages(self, query="is:unread subject:BiggerBrother"):
-        """Get unread messages matching query."""
+        """Get unread messages matching query with pagination (up to 10 pages)."""
         try:
-            results = self.service.users().messages().list(
-                userId='me', q=query, maxResults=10
-            ).execute()
-
             messages = []
-            for msg in results.get('messages', []):
-                full_msg = self.service.users().messages().get(
-                    userId='me', id=msg['id']
+            page_token = None
+            pages = 0
+            while True:
+                results = self.service.users().messages().list(
+                    userId='me', q=query, maxResults=50, pageToken=page_token
                 ).execute()
-
-                # Parse message
-                headers = {h['name']: h['value']
-                           for h in full_msg['payload']['headers']}
-
-                body = self._extract_body(full_msg['payload'])
-
-                messages.append({
-                    'id': msg['id'],
-                    'threadId': full_msg['threadId'],
-                    'from': headers.get('From', ''),
-                    'subject': headers.get('Subject', ''),
-                    'body': body
-                })
-
+                for msg in (results.get('messages') or []):
+                    full_msg = self.service.users().messages().get(
+                        userId='me', id=msg['id']
+                    ).execute()
+                    payload = full_msg.get('payload', {})
+                    headers = {h['name']: h['value'] for h in payload.get('headers', [])}
+                    body = self._extract_body(payload)
+                    messages.append({
+                        'id': msg['id'],
+                        'threadId': full_msg.get('threadId'),
+                        'from': headers.get('From', ''),
+                        'subject': headers.get('Subject', ''),
+                        'body': body
+                    })
+                page_token = results.get('nextPageToken')
+                pages += 1
+                if not page_token or pages >= 10:
+                    break
             return messages
         except Exception as e:
             print(f"Error fetching messages: {e}")
             return []
 
+
     def _extract_body(self, payload):
-        """Extract text body from message payload."""
+        """Extract text body from message payload with HTML fallback."""
         body = ""
-
+        # Multipart message
         if 'parts' in payload:
-            for part in payload['parts']:
-                if part['mimeType'] == 'text/plain':
-                    data = part['body']['data']
-                    body += base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
-        elif payload['body'].get('data'):
-            body = base64.urlsafe_b64decode(
-                payload['body']['data']
-            ).decode('utf-8', errors='ignore')
+            text_plain = []
+            text_html = []
+            stack = list(payload.get('parts', []))
+            # Walk nested multiparts
+            while stack:
+                part = stack.pop()
+                if 'parts' in part:
+                    stack.extend(part['parts'])
+                    continue
+                mime = part.get('mimeType', '')
+                data = part.get('body', {}).get('data')
+                if not data:
+                    continue
+                decoded = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+                if mime == 'text/plain':
+                    text_plain.append(decoded)
+                elif mime == 'text/html':
+                    text_html.append(decoded)
+            if text_plain:
+                body = "\n".join(text_plain)
+            elif text_html:
+                body = self._strip_html("\n".join(text_html))
+        # Single-part body
+        elif payload.get('body', {}).get('data'):
+            try:
+                body = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
+            except Exception:
+                body = ""
+        return (body or "").strip()
+        
+    def _strip_html(self, html: str) -> str:
+        """Best-effort HTML → text without extra deps."""
+        import re
+        from html import unescape
+        s = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", "", html)  # drop scripts/styles
+        s = re.sub(r"(?i)<br\\s*/?>", "\n", s)                      # <br> → newline
+        s = re.sub(r"(?i)</p\\s*>", "\n\n", s)                      # </p> → blank line
+        s = re.sub(r"<[^>]+>", "", s)                               # strip tags
+        s = unescape(s)
+        # normalize whitespace
+        return "\n".join(line.strip() for line in s.splitlines() if line.strip())
 
-        return body.strip()
 
     def send_email(self, to, subject, body, thread_id=None):
         """Send an email."""
@@ -299,25 +333,25 @@ class BiggerBrotherEmailSystem:
         self._print_status()
 
     def _monitor_emails(self):
-        """Background thread to monitor emails."""
+        """Background thread to monitor emails with exponential backoff."""
         self.logger.info("📧 Email monitoring started")
-
+        sleep_base = 15
+        backoff = sleep_base
+        max_backoff = 300
         while self.running:
             try:
-                # Check for new emails
                 messages = self.gmail.get_unread_messages()
-
                 for msg in messages:
                     if msg['id'] not in self.processed_emails:
                         self._process_email(msg)
                         self.processed_emails.add(msg['id'])
-
-                # Wait before next check
-                time.sleep(30)
-
+                backoff = sleep_base
+                time.sleep(backoff)
             except Exception as e:
                 self.logger.error(f"Email monitoring error: {e}")
-                time.sleep(60)
+                backoff = min(max_backoff, backoff * 2)
+                time.sleep(backoff)
+
 
     def _get_conversation_mode(self, from_addr):
         """Get the current conversation mode for a user."""
@@ -725,7 +759,7 @@ System Features:
         print("   with EnhancedLabelHarmonizer & Dual Scheduler Support")
         print("=" * 60)
         print(f"📧 Gmail: {self.gmail.email_address}")
-        print(f"📬 Monitoring: Every 30 seconds")
+        print(f"📬 Monitoring: adaptive 15–300s (exponential backoff)")
         print(f"🔍 Filter: subject:BiggerBrother")
 
         categories = self.system.logbook.get_categories_for_context()

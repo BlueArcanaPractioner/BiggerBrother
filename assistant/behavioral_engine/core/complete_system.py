@@ -486,7 +486,7 @@ class CompleteIntegratedSystem:
             if self.needs_harmonization():
                 print(f"⚠️ Harmonization recommended: {self.labels_created_count - self.last_harmonization_count} new labels")
                 # Automatically update two-tier groups periodically
-                if self.labels_created_count - self.last_harmonization_count >= 200:
+                if self.labels_created_count - self.last_harmonization_count >= 1:
                     print("🔄 Updating two-tier harmonization groups...")
                     for category in ['topic', 'tone', 'intent']:
                         self.harmonizer._update_harmonization_tier(category)
@@ -752,7 +752,7 @@ class CompleteIntegratedSystem:
             print(f"     - {general_file}")
             print(f"     - {specific_file}")
 
-    def needs_harmonization(self, threshold: int = 100) -> bool:
+    def needs_harmonization(self, threshold: int = 1) -> bool:
         """Check if harmonizer should be run based on new labels created."""
         return (self.labels_created_count - self.last_harmonization_count) >= threshold
 

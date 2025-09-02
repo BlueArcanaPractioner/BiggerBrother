@@ -1,0 +1,26 @@
+Reuse-only mode (short)
+REUSE-ONLY. Touch existing code only. Reuse helpers: _load_two_tier_maps, _canonicalize_label_list, _weighted_jaccard, _find_best_group, _find_best_specific_within, _save_embedding_cache. No new files/functions/classes. No new deps. No embeddings except via _get_embedding (cache miss only). If this can’t be done, reply NEEDS-REUSE.
+
+🩹 Diff-only patch
+DIFF-ONLY. Output a unified diff for similarity_matcher.py and nothing else. Keep imports/signatures/names. ≤ 60 added lines. Do not reformat unrelated code.
+
+🧭 Respect existing design
+RESPECT-STYLE. Keep current naming & style; do not rewrite modules. Prefer smallest viable change. Cite the exact functions you’re reusing before the patch (1–3 bullets).
+
+🧱 No abstractions
+NO-NEW-ABSTRACTIONS. Do not introduce helpers, wrappers, or new data structures. Prefer calling existing helpers even if slightly awkward.
+
+🚫 Don’t speculate
+NO-GUESSING. If a requirement is ambiguous, do not invent behavior; return a single clarifying question. Otherwise proceed.
+
+🧪 Safety limits
+LIMITS. Don’t touch imports. Don’t rename public symbols. Don’t change I/O formats. Hard fail if need
+
+REUSE-ONLY + DIFF-ONLY.
+
+Goal: Make find_similar_messages use harmonization_general/specific.json with weighted Jaccard (0.5/0.2/0.3). Reuse _load_two_tier_maps, _canonicalize_label_list, _weighted_jaccard, _find_best_group (for novel labels only), and persist via _save_embedding_cache on cache miss. No embeddings inside the scan loop.
+
+File: similarity_matcher.py
+
+If not feasible as stated, reply NEEDS-REUSE with one-line reason.
+
