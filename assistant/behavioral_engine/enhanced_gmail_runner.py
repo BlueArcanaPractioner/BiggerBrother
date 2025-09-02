@@ -804,7 +804,7 @@ System Features:
                     print("\n💬 Chat Mode - Let's have a conversation!")
                     print("(Type 'done' to finish)\n")
 
-                    chat_messages = []
+                    chat_messages = []  # keeps short context
 
                     while True:
                         user_input = input("You: ")
@@ -813,43 +813,55 @@ System Features:
                             print("\nChat ended. Thanks for the conversation!")
                             break
 
-                        chat_messages.append({'role': 'user', 'content': user_input})
+                        # 1) Always generate a conversational reply with 4o
+                        #    (use recent context; DO NOT depend on the extractor for text)
+                        try:
+                            # keep last few turns for continuity
+                            recent = chat_messages[-4:]
+                            response_text = self.system.openai_client.chat(
+                                messages=[
+                                    {"role": "system",
+                                     "content": "You are a sincere, reflective conversational partner. Keep replies natural, succinct, and context-aware."},
+                                    *recent,
+                                    {"role": "user", "content": user_input}
+                                ],
+                                model="gpt-4o"
+                            )
+                        except Exception:
+                            # If 4o fails, fall back to a safe human sentence
+                            response_text = "I’m here. Keep going—what feels most alive in that thought?"
 
-                        # Process with context
-                        result = self.system.process_message_with_context(user_input)
-
-                        # Generate conversational response
-                        if len(chat_messages) >= 1:
-                            # Use recent context for better flow
-                            context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_messages[-3:]])
-
-                            try:
-                                response = self.system.openai_client.chat(
-                                    messages=[
-                                        {"role": "system",
-                                         "content": f"Continue this natural conversation:\n{context}"},
-                                        {"role": "user", "content": user_input}
-                                    ],
-                                    model="gpt-4o"
-                                )
-                            except Exception as e:
-                                print(f"GPT-4 call failed: {e}")
-                                response = "Tell me more about that."  # Don't use result.get('response')
+                        # 2) Print ONLY the human reply
+                        #    Guard: if somehow we got JSON back, don’t dump it on the user
+                        from json import loads as _loads
+                        if isinstance(response_text, (dict, list)):
+                            response_text = "Noted. Tell me more."
                         else:
-                            response = result.get('response', 'Tell me more about that.')
+                            s = (response_text or "").strip()
+                            if s.startswith("{") or s.startswith("["):
+                                try:
+                                    _loads(s)  # it's JSON-like
+                                    response_text = "Noted. Tell me more."
+                                except Exception:
+                                    pass
 
-                        chat_messages.append({'role': 'assistant', 'content': response})
+                        print(f"\nAssistant: {response_text}")
 
-                        print(f"\nAssistant: {response}")
+                        # 3) Update local chat context AFTER printing
+                        chat_messages.append({"role": "user", "content": user_input})
+                        chat_messages.append({"role": "assistant", "content": response_text})
 
-                        # Show unique concepts
-                        if result.get('label_insights'):
-                            insights = result['label_insights']
-                            for cat, info in insights.items():
-                                if info.get('unique_concepts', 0) > 0:
-                                    print(f"  [{cat}: {info['unique_concepts']} unique]", end="")
-                            if any(v.get('unique_concepts', 0) > 0 for v in insights.values()):
+                        # 4) Run your analyzer/extractor in the background of the UX
+                        #    (it returns structured JSON; do NOT print it)
+                        try:
+                            result = self.system.process_message_with_context(user_input)
+                            # OPTIONAL tiny footer to show logging happened, without leaking JSON
+                            if result.get('labels_generated', 0) > 0:
+                                print(f"  [{result['labels_generated']} topics noted]", end="")
                                 print()
+                        except Exception as e:
+                            # keep chat resilient even if extractor hiccups
+                            print(f"  [extractor error: {e}]")
 
                 elif choice == '4':
                     print(self._get_status_summary())
