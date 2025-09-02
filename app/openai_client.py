@@ -1,6 +1,10 @@
 # app/openai_client.py
 from __future__ import annotations
+
 import os, json, typing as t
+import sys
+from datetime import datetime, timezone, time
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,6 +30,42 @@ def _offline_payload(prompt: str) -> str:
         "confidence": 0.5,
     })
 
+def _offline_reason(self) -> str | None:
+    if os.getenv("AGENT_OFFLINE") == "1":
+        return "AGENT_OFFLINE=1"
+    try:
+        import openai  # noqa
+    except Exception:
+        return "openai SDK not importable"
+    if not os.getenv("OPENAI_API_KEY"):
+        return "OPENAI_API_KEY missing"
+    return None
+
+def _offline(self) -> bool:
+    return self._offline_reason() is not None
+
+def _safe(obj):
+    # Best effort to stringify OpenAI SDK responses without exploding
+    try:
+        # v1 client objects often have model_dump_json/model_dump
+        if hasattr(obj, "model_dump_json"):
+            return obj.model_dump_json(indent=2, ensure_ascii=False)
+        if hasattr(obj, "model_dump"):
+            return json.dumps(obj.model_dump(mode="json"), indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+    try:
+        return json.dumps(obj, indent=2, ensure_ascii=False)
+    except Exception:
+        return str(obj)
+
+def _dbg(label: str, payload):
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+    if isinstance(payload, (dict, list)):
+        print(f"[API-DEBUG {ts}] {label}:\n{_safe(payload)}", file=sys.stderr, flush=True)
+    else:
+        print(f"[API-DEBUG {ts}] {label}: {payload}", file=sys.stderr, flush=True)
+
 class OpenAIClient:
     """
     .complete(prompt, model=None, **kwargs) -> str
@@ -34,7 +74,8 @@ class OpenAIClient:
     - Offline (no key / AGENT_OFFLINE=1 / import fail) -> deterministic JSON
     - Never raises; returns '[ERROR COMPLETION: ...]' on exceptions
     """
-    def __init__(self) -> None:
+    def __init__(self, raise_on_fail: bool | None = None) -> None:
+        self.raise_on_fail = True if raise_on_fail is None else raise_on_fail
         self._sdk = None
         self._new = False
         self.client = None
@@ -59,21 +100,70 @@ class OpenAIClient:
             or not os.getenv("OPENAI_API_KEY")
         )
 
-    def chat(self, messages: list[dict], model: str | None = None, **kwargs) -> str:
-        m = model or os.getenv("OPENAI_MODEL") or "gpt-5-nano"
-        if self._offline():
-            # reuse your offline payload helper
-            return _offline_payload(messages[-1]["content"] if messages else "")
-        kw = {k: v for k, v in kwargs.items() if k in _allowlist_for(m)}
+    def chat(self, *, messages, model: str, **kwargs) -> str:
+        reason = _offline_reason(self)
+        # Print request upfront
+        _dbg("REQUEST.chat", {
+            "model": model,
+            "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            # DO NOT log headers or keys
+            "messages": messages,
+            "kwargs": {k: v for k, v in kwargs.items() if k not in ("api_key", "headers")}
+        })
+
+        if reason:
+            _dbg("OFFLINE", reason)
+            # your existing stub path
+            stub = _offline_payload(messages[-1]["content"] if messages else "")
+            _dbg("RESPONSE.chat (offline stub)", stub)
+            return stub
+
+        t0 = datetime.now(timezone.utc)
         try:
-            if self._new and hasattr(self.client, "chat"):
-                resp = self.client.chat.completions.create(model=m, messages=messages, **kw)
-                return resp.choices[0].message.content or ""
-            # old 0.x fallback
-            resp = self.client.ChatCompletion.create(model=m, messages=messages, **kw)  # type: ignore[attr-defined]
-            return resp["choices"][0]["message"]["content"]
+            # Example using the modern client; adapt to whatever you’re using:
+            # resp = self._sdk.chat.completions.create(model=model, messages=messages, **kwargs)
+            resp = self._sdk.chat.completions.create(model=model, messages=messages, **kwargs)
+
+            dt = datetime.now(timezone.utc) - t0
+            _dbg("RESPONSE.chat.raw", {"elapsed_s": round(dt, 3), "resp": resp})
+
+            # Extract text content
+            content = None
+            try:
+                content = resp.choices[0].message.content
+            except Exception:
+                # Fallback for Responses API or other shapes
+                content = getattr(resp, "output_text", None) or str(resp)
+
+            _dbg("RESPONSE.chat.content", content)
+            return content
+
         except Exception as e:
-            return f"[ERROR CHAT: {e}]"
+            # OpenAI Python v1 exceptions usually have status_code + response
+            status = getattr(e, "status_code", None)
+            body = None
+            try:
+                r = getattr(e, "response", None)
+                if r is not None:
+                    # requests-like
+                    body = getattr(r, "text", None) or getattr(r, "content", None)
+            except Exception:
+                body = None
+
+            _dbg("ERROR.chat", {
+                "type": type(e).__name__,
+                "status": status,
+                "message": str(e),
+                "body": body[:2000] if isinstance(body, (str, bytes)) else body
+            })
+
+            # Special attention for 4xx as requested
+            if status and 400 <= status < 500:
+                _dbg("ERROR.chat.4xx", {"status": status, "body": body})
+
+            if self.raise_on_fail:
+                raise
+            return "__OPENAI_CALL_FAILED__"
 
     def complete(self, prompt: str, model: str | None = None, **kwargs) -> str:
         # legacy text-* path, kept for completeness
