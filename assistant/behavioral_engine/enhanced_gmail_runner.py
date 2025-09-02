@@ -813,15 +813,25 @@ System Features:
                             print("\nChat ended. Thanks for the conversation!")
                             break
 
+                        try:
+                            result = self.system.process_message_with_context(user_input)
+                            # OPTIONAL tiny footer to show logging happened, without leaking JSON
+                            if result.get('labels_generated', 0) > 0:
+                                print(f"  [{result['labels_generated']} topics noted]", end="")
+                                print()
+                        except Exception as e:
+                            # keep chat resilient even if extractor hiccups
+                            print(f"  [extractor error: {e}]")
+
                         # 1) Always generate a conversational reply with 4o
                         #    (use recent context; DO NOT depend on the extractor for text)
                         try:
                             # keep last few turns for continuity
-                            recent = chat_messages[-4:]
+                            recent = chat_messages[-40:]
                             response_text = self.system.openai_client.chat(
                                 messages=[
                                     {"role": "system",
-                                     "content": "You are a sincere, reflective conversational partner. Keep replies natural, succinct, and context-aware."},
+                                     "content": "Keep replies natural, and context-aware."},
                                     *recent,
                                     {"role": "user", "content": user_input}
                                 ],
@@ -853,15 +863,7 @@ System Features:
 
                         # 4) Run your analyzer/extractor in the background of the UX
                         #    (it returns structured JSON; do NOT print it)
-                        try:
-                            result = self.system.process_message_with_context(user_input)
-                            # OPTIONAL tiny footer to show logging happened, without leaking JSON
-                            if result.get('labels_generated', 0) > 0:
-                                print(f"  [{result['labels_generated']} topics noted]", end="")
-                                print()
-                        except Exception as e:
-                            # keep chat resilient even if extractor hiccups
-                            print(f"  [extractor error: {e}]")
+
 
                 elif choice == '4':
                     print(self._get_status_summary())

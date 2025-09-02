@@ -125,7 +125,8 @@ class OpenAIClient:
             resp = self._sdk.chat.completions.create(model=model, messages=messages, **kwargs)
 
             dt = datetime.now(timezone.utc) - t0
-            _dbg("RESPONSE.chat.raw", {"elapsed_s": round(dt, 3), "resp": resp})
+            elapsed = dt.total_seconds()
+            _dbg("RESPONSE.chat.raw", {"elapsed_s": round(elapsed, 3), "resp": resp})
 
             # Extract text content
             content = None

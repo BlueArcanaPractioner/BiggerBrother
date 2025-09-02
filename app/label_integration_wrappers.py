@@ -60,7 +60,7 @@ class LabelGenerator:
             # Call OpenAI to generate labels
             if hasattr(self.openai_client, "chat"):
                 raw = self.openai_client.chat(
-                    [{"role": "user", "content": prompt}],
+                    messages=[{"role": "user", "content": prompt}],
                     model="gpt-5-nano",
                     response_format={"type": "json_object"},
                 )
@@ -98,7 +98,7 @@ class LabelGenerator:
         try:
             if hasattr(self.openai_client, "chat"):
                 raw = self.openai_client.chat(
-                    [{"role": "user", "content": prompt}],
+                    messages=[{"role": "user", "content": prompt}],
                     model="gpt-5-nano",
                     response_format={"type": "json_object"},
                 )

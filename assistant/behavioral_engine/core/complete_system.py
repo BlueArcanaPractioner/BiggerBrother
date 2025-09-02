@@ -463,7 +463,7 @@ class CompleteIntegratedSystem:
                     "raw_labels": raw_labels,
                     "harmonized": harmonized,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "similar_messages": similar_messages[:3]  # Save top 3 similar messages
+                    "similar_messages": similar_messages[:30000]  # Save top 3 similar messages
                 }, f, indent=2)
 
             # Count labels created

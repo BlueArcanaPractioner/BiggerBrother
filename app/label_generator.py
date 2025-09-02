@@ -341,7 +341,7 @@ def main(inputs: Dict[str, Any], outputs: Dict[str, Any], openai_client: Any = N
             try:
                 if hasattr(openai_client, "chat"):
                     raw = openai_client.chat(
-                        [{"role": "user", "content": prompt}],
+                        messages=[{"role": "user", "content": prompt}],
                         model=model_hint,
                         response_format={"type": "json_object"},
                     )
