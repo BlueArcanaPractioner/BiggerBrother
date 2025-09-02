@@ -808,6 +808,7 @@ System Features:
 
                     while True:
                         user_input = input("You: ")
+                        result = ""
 
                         if user_input.lower() in ['done', 'exit']:
                             print("\nChat ended. Thanks for the conversation!")
@@ -825,13 +826,26 @@ System Features:
 
                         # 1) Always generate a conversational reply with 4o
                         #    (use recent context; DO NOT depend on the extractor for text)
+                            # 2) THEN: Generate conversational reply with context
                         try:
                             # keep last few turns for continuity
                             recent = chat_messages[-40:]
+
+                            # Build context from similar messages
+                            system_content = "Keep replies natural, and context-aware."
+                            if result.get('similar_messages'):
+                                # Take top N similar messages (limit total size)
+                                similar_msgs = result['similar_messages'][:50]  # Top 5
+                                if similar_msgs:
+                                    system_content += "\n\nRelevant context from past conversations:\n"
+                                    for i, msg in enumerate(similar_msgs, 1):
+                                        # Truncate each message to avoid overwhelming
+                                        truncated = msg[:10000] + "..." if len(msg) > 10000 else msg
+                                        system_content += f"\n{i}. {truncated}"
+
                             response_text = self.system.openai_client.chat(
                                 messages=[
-                                    {"role": "system",
-                                     "content": "Keep replies natural, and context-aware."},
+                                    {"role": "system", "content": system_content},
                                     *recent,
                                     {"role": "user", "content": user_input}
                                 ],

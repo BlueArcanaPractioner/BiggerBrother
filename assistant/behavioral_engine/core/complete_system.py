@@ -392,8 +392,20 @@ class CompleteIntegratedSystem:
                 min_chars_recent=50000,
                 min_chars_long_term=100000
             )
-            similar_messages = [msg["content"] for msg in context_messages[:500000]]
-            print(f"   Found {len(context_messages)} similar messages for context")
+
+            # Load messages up to character limit, not message count
+            similar_messages = []
+            char_count = 0
+            target_chars = 150000  # Adjust as needed
+
+            for msg in context_messages:
+                msg_content = msg.get("content", "")
+                char_count += len(msg_content)
+                similar_messages.append(msg_content)
+                if char_count >= target_chars:
+                    break
+
+            print(f"   Found {len(similar_messages)} similar messages ({char_count} chars) for context")
         else:
             similar_messages = []
             print("   No context matcher initialized")
@@ -440,6 +452,7 @@ class CompleteIntegratedSystem:
             response["labels"] = scheduler_response.get("labels", [])
             response["context_size"] = scheduler_response.get("context_size", 0)
             response["similar_messages_count"] = len(similar_messages)
+            response["similar_messages"] = similar_messages
 
         elif self.active_detailed_session:
             # Process through detailed activity logger
