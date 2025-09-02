@@ -120,16 +120,31 @@ class EnhancedLabelHarmonizer:
         # Load original harmonization report if it exists
         self._load_original_report()
 
+    
+    def enable_batch_mode(self):
+        """Enable batch processing mode for better performance."""
+        self.batch_processing = True
+        self.similarity_cache.clear()  # Clear cache for fresh batch
+        
+    def disable_batch_mode(self):
+        """Disable batch mode and optionally clear caches."""
+        self.batch_processing = False
+        # Keep cache for future use unless it's too large
+        if len(self.similarity_cache) > 10000:
+            # Keep only most recent 5000 entries
+            items = list(self.similarity_cache.items())
+            self.similarity_cache = dict(items[-5000:])
+
     def _load_embedding_cache(self):
-        """Load cached embeddings if available."""
-        if self.embedding_cache_file.exists():
-            try:
-                import pickle
-                with open(self.embedding_cache_file, 'rb') as f:
-                    self.embedding_cache = pickle.load(f)
-                logger.info(f"Loaded {len(self.embedding_cache)} cached embeddings")
-            except Exception as e:
-                logger.warning(f"Could not load embedding cache: {e}")
+            """Load cached embeddings if available."""
+            if self.embedding_cache_file.exists():
+                try:
+                    import pickle
+                    with open(self.embedding_cache_file, 'rb') as f:
+                        self.embedding_cache = pickle.load(f)
+                    logger.info(f"Loaded {len(self.embedding_cache)} cached embeddings")
+                except Exception as e:
+                    logger.warning(f"Could not load embedding cache: {e}")
 
     def _save_embedding_cache(self):
         """Save embeddings to cache."""
@@ -192,21 +207,34 @@ class EnhancedLabelHarmonizer:
                 self.save_harmonization_tiers()
 
     def _load_harmonization_tier(self, file_path: Path, groups_dict: Dict, tier_name: str):
-        """Load a harmonization tier from file."""
+        """Load a harmonization tier from file with error handling."""
         logger.info(f"Loading {tier_name} harmonization from {file_path}")
 
-        with open(file_path, 'r') as f:
-            data = json.load(f)
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
 
-        for category in ['topic', 'tone', 'intent']:
-            if category in data and 'groups' in data[category]:
-                groups_dict[category] = data[category]['groups']
-                logger.info(f"  {category}: Loaded {len(groups_dict[category])} {tier_name} groups")
+            for category in ['topic', 'tone', 'intent']:
+                if category in data and 'groups' in data[category]:
+                    groups_dict[category] = data[category]['groups']
+                    logger.info(f"  {category}: Loaded {len(groups_dict[category])} {tier_name} groups")
+        except json.JSONDecodeError as e:
+            logger.error(f"  ❌ JSON decode error in {file_path}: {e}")
+            logger.info(f"  Creating empty {tier_name} structure")
+            # Initialize with empty structure
+            for category in ['topic', 'tone', 'intent']:
+                groups_dict[category] = {}
+        except Exception as e:
+            logger.error(f"  ❌ Error loading {file_path}: {e}")
+            # Initialize with empty structure
+            for category in ['topic', 'tone', 'intent']:
+                groups_dict[category] = {}
+
 
     def _get_embedding(self, text: str) -> np.ndarray:
         """Get embedding for text (cached or compute)."""
         if text in self.embedding_cache:
-            print(f"Found cached embedding: {text} val: {self.embedding_cache[text]}")
+            # Debug: cached embedding found
             return self.embedding_cache[text]
 
         if self.use_real_embeddings:
@@ -337,7 +365,7 @@ class EnhancedLabelHarmonizer:
                 if similarity >= threshold:
                     group.append(other)
                     processed.add(other)
-                    print(f"comparing {text} with {other}")
+                    # Removed debug print for performance
 
             groups[text] = group
 
@@ -410,12 +438,19 @@ class EnhancedLabelHarmonizer:
         Compute similarity between two labels.
         First tries string matching, then uses embeddings if needed.
         """
+        # Check cache first
+        cache_key = tuple(sorted([label1, label2]))
+        if cache_key in self.similarity_cache:
+            return self.similarity_cache[cache_key]
+        
         # Quick string similarity check first
         string_sim = self.compute_string_similarity(label1, label2)
 
         # If string similarity is high enough, don't bother with embeddings
         if string_sim >= 0.85:
-            return string_sim
+            # Cache the result
+            self.similarity_cache[cache_key] = string_sim
+        return string_sim
 
         # If string similarity is very low, don't waste API calls
         if string_sim < 0.3:
@@ -428,14 +463,23 @@ class EnhancedLabelHarmonizer:
             embedding_sim = self._cosine_similarity(emb1, emb2)
 
             # Weighted average of string and embedding similarity
-            return (string_sim * 0.3) + (embedding_sim * 0.7)
+            # Cache the result
+            result = (string_sim * 0.3) + (embedding_sim * 0.7)
+            self.similarity_cache[cache_key] = result
+            return result
 
         return string_sim
 
     def _build_groups(self, labels_with_freq: List[Tuple[str, float]], threshold: float) -> Dict[str, List[str]]:
         """Build groups of labels based on similarity threshold."""
+        # Deduplicate labels first (keep highest frequency)
+        unique_labels = {}
+        for label, freq in labels_with_freq:
+            if label not in unique_labels or freq > unique_labels[label]:
+                unique_labels[label] = freq
+        
         # Sort by frequency
-        sorted_labels = sorted(labels_with_freq, key=lambda x: x[1], reverse=True)
+        sorted_labels = sorted(unique_labels.items(), key=lambda x: x[1], reverse=True)
 
         groups = {}
         assigned = set()
@@ -466,11 +510,11 @@ class EnhancedLabelHarmonizer:
                 if embeddings and label in embeddings and other_label in embeddings:
                     # Use embedding similarity
                     similarity = self._cosine_similarity(embeddings[label], embeddings[other_label])
-                    print(f"comparing {label} with {other_label}")
+                    # Removed debug print for performance
                 else:
                     # Fall back to string similarity
                     similarity = self.compute_string_similarity(label, other_label)
-                    print(f"comparing {label} with {other_label}")
+                    # Removed debug print for performance
 
                 if similarity >= threshold:
                     group.append(other_label)
@@ -995,7 +1039,7 @@ def main():
     # Create enhanced importer
     importer = EnhancedSmartLabelImporter(
         graph,
-        data_dir="C:/BiggerBrother/data",
+        data_dir="C:/BiggerBrother-minimal/data",
         use_harmonization_report=True
     )
 

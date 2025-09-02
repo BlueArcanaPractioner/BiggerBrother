@@ -27,7 +27,7 @@ class LabelGenerator:
         self.openai_client = openai_client
         self.data_root = Path("data")
         
-    def generate_labels_for_text(self, text: str, metadata: Optional[Dict] = None) -> Dict[str, List[Dict]]:
+    def generate_labels_for_text(self, text: str, metadata: Optional[Dict] = None) -> List[Dict]:
         """
         Generate labels for a single text string.
         
@@ -36,12 +36,8 @@ class LabelGenerator:
             metadata: Optional metadata (gid, role, conversation_id, etc.)
             
         Returns:
-            Dictionary with categorized labels (topic, tone, intent)
+            List of label dictionaries with 'label' and 'confidence' keys
         """
-        # Handle None metadata
-        if metadata is None:
-            metadata = {}
-        
         # Create a chunk structure
         chunk = {
             "gid": metadata.get("gid", "temp_" + str(hash(text))[:8]),
@@ -70,17 +66,23 @@ class LabelGenerator:
             # Parse the response
             payload = label_generator._coerce_json(raw)
             
-            # Return categorized labels as expected by the system
-            return {
-                "topic": label_generator._norm_list(payload.get("topic", [])),
-                "tone": label_generator._norm_list(payload.get("tone", [])),
-                "intent": label_generator._norm_list(payload.get("intent", [])),
-                "confidence": payload.get("confidence", 0.5)
-            }
+            # Flatten the categorized labels into a single list
+            labels = []
+            
+            for category in ["topic", "tone", "intent"]:
+                category_labels = label_generator._norm_list(payload.get(category, []))
+                for item in category_labels:
+                    labels.append({
+                        "category": category,
+                        "label": item["label"],
+                        "confidence": item["p"]
+                    })
+            
+            return labels
             
         except Exception as e:
             print(f"Error generating labels: {e}")
-            return {"topic": [], "tone": [], "intent": [], "confidence": 0.0}
+            return []
     
     def generate_labels_for_chunk(self, chunk: Dict) -> Dict:
         """

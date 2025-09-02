@@ -1,10 +1,10 @@
 # BiggerBrother Codebase Context
 
 ## Summary
-- **Files**: 34 Python files
-- **Lines**: 15,362 total lines
-- **Classes**: 60 classes
-- **Functions**: 447 functions/methods
+- **Files**: 38 Python files
+- **Lines**: 16,907 total lines
+- **Classes**: 65 classes
+- **Functions**: 488 functions/methods
 - **Main Packages**: app, assistant
 - **External Dependencies**: __future__, app, argparse, assistant, base64, csv, data_config, difflib, dotenv, email, glob, google, google_auth_oauthlib, googleapiclient, jsonschema, label_generator, logging, numpy, openai, openai_client, pickle, platform, plyer, requests, schedule, smtplib, statistics, threading, traceback
 
@@ -41,12 +41,12 @@ data/
 - `app.label_generator`: _extract_first_json_object, _extract_first_json_object(), _load_prompt_head()
 - `app.label_integration_wrappers`: get_label_statistics()
 - `app.openai_client`: _offline_payload()
+- `assistant.behavioral_engine.context.similarity_matcher`: _get_embedding(), _load_chunk_by_gid(), _load_embedding_cache()
 - `assistant.behavioral_engine.core.complete_system`: _extract_to_logbooks(), analyze_behavioral_patterns(), extracted.get
 - `assistant.behavioral_engine.enhanced_gmail_runner`: _extract_body(), _get_conversation_mode(), _get_help_text()
+- `assistant.behavioral_engine.features.enhanced_feature_extraction`: _get_logs_in_window(), _load_top_words(), _load_user_vocabulary()
 - `assistant.behavioral_engine.gamification.rpg_system`: _load_achievements(), _load_character(), _load_quest_history()
 - `assistant.behavioral_engine.logbooks.dynamic_logbook_system`: _extract_activities(), _load_categories(), _save_categories()
-- `assistant.behavioral_engine.planners.integrated_daily_planner`: _get_recent_meals(), _load_plan(), _save_plan()
-- `assistant.behavioral_engine.routines.routine_builder`: _get_next_step(), _get_routine_progress(), _load_routines()
 
 ## Key Modules and Classes
 
@@ -80,7 +80,7 @@ Imports: `app.coverage_checker, app.label_generator, app.openai_client.OpenAICli
 ```python
 class LabelGenerator:
     def __init__(self, openai_client)
-    def generate_labels_for_text(self, text: str, metadata: Optional[Dict]=None) -> List[Dict]
+    def generate_labels_for_text(self, text: str, metadata: Optional[Dict]=None) -> Dict[Tuple]
     def generate_labels_for_chunk(self, chunk: Dict) -> Dict
     def batch_generate_labels(self, texts: List[str], labels_dir: str='labels', skip_existing: bool=True) -> Dict[Tuple]
 class CoverageChecker:
@@ -101,16 +101,32 @@ class OpenAIClient:
 
 ### assistant/
 
+**`assistant\behavioral_engine\context\similarity_matcher.py`**
+_Context Similarity Matcher for BiggerBrother_
+📥 Reads: `<cache_file>, <chunk_file>`
+📤 Writes: `<tier>`
+📁 Uses: `<header_parts>, data/`
+Imports: `__future__.annotations, app.label_integration_wrappers.LabelGenerator, app.openai_client.OpenAIClient, assistant.importers.enhanced_smart_label_importer.EnhancedLabelHarmonizer, collections.defaultdict`
+```python
+class ContextSimilarityMatcher:
+    def __init__(self, labels_dir: str='labels', chunks_dir: str='data/chunks', harmonization_dir: str='data', openai_client: Optional[OpenAIClient]=None, harmonizer: Optional[EnhancedLabelHarmonizer]=None, context_minimum_char_long_term: int=150000, context_minimum_char_recent: int=50000, max_context_messages: int=500000, general_tier_weight: float=0.3, specific_tier_weight: float=0.7, recency_decay_factor: float=0.998, recency_cutoff_days: int=3650)
+    def get_message_labels(self, message: str) -> Dict
+    def harmonize_and_score_labels(self, labels: Dict) -> Dict
+    def calculate_similarity_score(self, current_harmonized: Dict, target_harmonized: Dict, message_timestamp: datetime) -> float
+    def find_similar_messages(self, message: str, min_chars_recent: Optional[int]=None, min_chars_long_term: Optional[int]=None) -> Tuple[Tuple]
+    def build_context_header(self, message: str, max_chars: int=150000) -> str
+```
+
 **`assistant\behavioral_engine\core\complete_system.py`**
 _Complete Integrated System with Dynamic LogBooks and Two-Tier Harmonization_
 📥 Reads: `<dynamic>, <label_file>`
 📤 Writes: `<dynamic>, <readme_content>`
 📁 Uses: `/`
-Imports: `__future__.annotations, app.label_integration_wrappers.LabelGenerator, app.openai_client.OpenAIClient, assistant.behavioral_engine.features.enhanced_feature_extraction.EnhancedFeatureExtractor, assistant.behavioral_engine.gamification.rpg_system.RPGSystem`
+Imports: `__future__.annotations, app.label_integration_wrappers.LabelGenerator, app.openai_client.OpenAIClient, assistant.behavioral_engine.context.similarity_matcher.ContextSimilarityMatcher, assistant.behavioral_engine.features.enhanced_feature_extraction.EnhancedFeatureExtractor`
 ```python
 class CompleteIntegratedSystem:
     def __init__(self, base_dir: str=None, use_sandbox: bool=False, sandbox_name: Optional[str]=None, use_config: bool=True)
-    def get_similar_messages_for_context(self, current_labels: Dict[Tuple], limit: int=10) -> List[str]
+    def get_similar_messages_for_context(self, message: str, current_labels: Dict[Tuple], limit: int=10) -> List[str]
     def select_context_categories_by_labels(self, harmonized_labels: Dict) -> Tuple[Tuple]
     def process_message_with_context(self, message: str) -> Dict
     def analyze_behavioral_patterns(self, days: int=30)
@@ -147,6 +163,30 @@ class BiggerBrotherEmailSystem:
     def start(self)
     def run_interactive(self)
     def stop(self)
+```
+
+**`assistant\behavioral_engine\features\enhanced_feature_extraction.py`**
+_Enhanced Feature Extraction System_
+📥 Reads: `<filepath>, <vocab_file>`
+📤 Writes: `<dynamic>, <session_features>`
+📁 Uses: `
+Features saved to data/, <filename>, data/`
+Imports: `__future__.annotations, assistant.graph.store.GraphStore, assistant.logger.unified.UnifiedLogger, collections.Counter, collections.defaultdict`
+```python
+class MessageFeatures:
+    def to_dict(self) -> Dict
+class ActivityFeatures:
+    def to_dict(self) -> Dict
+class SessionFeatures:
+    def to_dict(self) -> Dict
+class EnhancedFeatureExtractor:
+    def __init__(self, logger: UnifiedLogger, graph_store: GraphStore, data_dir: str='data/features')
+    def extract_message_features(self, message: str, timestamp: datetime, previous_timestamp: Optional[datetime]=None, context_window_hours: int=24) -> MessageFeatures
+    def extract_activity_features(self, start_time: datetime, end_time: datetime) -> ActivityFeatures
+    def extract_session_features(self, session_id: str, messages: List[Dict], labels: List[List[str]]) -> SessionFeatures
+    def save_features(self, features: Any, filename: str) -> None
+    def save_vocabulary_stats(self) -> None
+    def get_feature_summary(self, session_features: SessionFeatures) -> Dict[Tuple]
 ```
 
 **`assistant\behavioral_engine\gamification\rpg_system.py`**
@@ -402,6 +442,8 @@ Imports: `assistant.graph.store.GraphStore, collections.Counter, collections.def
 ```python
 class EnhancedLabelHarmonizer:
     def __init__(self, harmonization_report_path: str='data/harmonization_report.json', target_groups: Dict[Tuple]=None, similarity_threshold: float=0.8, min_semantic_distance: float=0.5, use_real_embeddings: bool=True, embedding_cache_file: str='data/embedding_cache.pkl')
+    def enable_batch_mode(self)
+    def disable_batch_mode(self)
     def compute_string_similarity(self, label1: str, label2: str) -> float
     def compute_similarity(self, label1: str, label2: str, use_embeddings: bool=True) -> float
     def find_canonical(self, label: str, category: str) -> Tuple[Tuple]
@@ -525,10 +567,10 @@ class CodebaseAnalyzer:
 
 **Processing Modules** (transformation):
 - `assistant.conversational_logger`
+- `assistant.behavioral_engine.context.similarity_matcher`
+- `assistant.behavioral_engine.features.enhanced_feature_extraction`
 - `assistant.behavioral_engine.gamification.rpg_system`
 - `assistant.behavioral_engine.logbooks.dynamic_logbook_system`
-- `assistant.behavioral_engine.planners.integrated_daily_planner`
-- `assistant.behavioral_engine.routines.routine_builder`
 
 ## Key Dependencies
 

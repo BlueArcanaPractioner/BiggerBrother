@@ -376,7 +376,7 @@ Be specific and actionable. Include all mentioned activities."""
                     {"role": "system", "content": "You are a behavioral routine analyst."},
                     {"role": "user", "content": prompt}
                 ],
-                model="gpt-4o-mini"
+                model="gpt-4o"
             )
             
             # Parse response
@@ -715,7 +715,7 @@ Return as JSON array of strings."""
                     {"role": "system", "content": "You are a behavioral optimization expert."},
                     {"role": "user", "content": prompt}
                 ],
-                model="gpt-4o-mini"
+                model="gpt-4o"
             )
             
             # Parse response

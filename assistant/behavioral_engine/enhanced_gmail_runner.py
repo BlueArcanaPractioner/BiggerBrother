@@ -22,7 +22,7 @@ import re
 from enum import Enum
 
 # Add BiggerBrother to path
-sys.path.insert(0, r'C:\BiggerBrother')
+sys.path.insert(0, r'C:\BiggerBrother-minimal')
 
 # Gmail OAuth imports
 from google.auth.transport.requests import Request
@@ -819,7 +819,7 @@ System Features:
                         result = self.system.process_message_with_context(user_input)
 
                         # Generate conversational response
-                        if len(chat_messages) > 1:
+                        if len(chat_messages) >= 1:
                             # Use recent context for better flow
                             context = "\n".join([f"{m['role']}: {m['content']}" for m in chat_messages[-3:]])
 
@@ -832,8 +832,9 @@ System Features:
                                     ],
                                     model="gpt-4o"
                                 )
-                            except:
-                                response = result.get('response', 'Tell me more about that.')
+                            except Exception as e:
+                                print(f"GPT-4 call failed: {e}")
+                                response = "Tell me more about that."  # Don't use result.get('response')
                         else:
                             response = result.get('response', 'Tell me more about that.')
 
