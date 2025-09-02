@@ -18,6 +18,7 @@ import numpy as np
 
 from app.openai_client import OpenAIClient
 from app.label_integration_wrappers import LabelGenerator
+from assistant.importers.enhanced_smart_label_importer import EnhancedLabelHarmonizer
 
 
 class ContextSimilarityMatcher:
@@ -32,15 +33,16 @@ class ContextSimilarityMatcher:
         chunks_dir: str = "data/chunks", 
         harmonization_dir: str = "data",
         openai_client: Optional[OpenAIClient] = None,
+        harmonizer: Optional[EnhancedLabelHarmonizer] = None,
         # Context size parameters
-        context_minimum_char_long_term: int = 50000,
-        context_minimum_char_recent: int = 10000,
-        max_context_messages: int = 50,
+        context_minimum_char_long_term: int = 150000,
+        context_minimum_char_recent: int = 50000,
+        max_context_messages: int = 500000,
         # Weighting parameters
         general_tier_weight: float = 0.3,
         specific_tier_weight: float = 0.7,
-        recency_decay_factor: float = 0.95,  # Per day decay
-        recency_cutoff_days: int = 30
+        recency_decay_factor: float = 0.998,  # Per day decay
+        recency_cutoff_days: int = 3650,
     ):
         """
         Initialize the similarity matcher.
@@ -64,6 +66,7 @@ class ContextSimilarityMatcher:
         
         self.openai_client = openai_client or OpenAIClient()
         self.label_generator = LabelGenerator(self.openai_client)
+        self.harmonizer = harmonizer
         
         # Context parameters
         self.context_minimum_char_long_term = context_minimum_char_long_term
@@ -277,20 +280,86 @@ class ContextSimilarityMatcher:
         
         return best_group
     
-    def _get_embedding(self, text: str) -> Optional[np.ndarray]:
-        """Get embedding for text, using cache when possible."""
-        if text in self.embedding_cache:
-            return np.array(self.embedding_cache[text])
         
-        try:
-            # This would normally call OpenAI embeddings API
-            # For now, returning None to indicate we need to implement this
-            # In production, you'd call: openai.Embedding.create(input=text, model="text-embedding-ada-002")
-            return None
-        except Exception as e:
-            print(f"Error getting embedding for '{text}': {e}")
-            return None
+    def _get_embedding(self, text: str) -> Optional[np.ndarray]:
     
+        """Get embedding for text, using cache when possible."""
+    
+        if text in self.embedding_cache:
+    
+            return np.array(self.embedding_cache[text])
+    
+        
+    
+        # Use the harmonizer's embedding functionality if available
+    
+        if self.harmonizer:
+    
+            try:
+    
+                embedding = self.harmonizer._get_embedding(text)
+    
+                if embedding is not None:
+    
+                    return embedding
+    
+            except Exception as e:
+    
+                print(f"Harmonizer embedding failed: {e}")
+    
+        
+    
+        # Fall back to simulated embedding
+    
+        return self._simulated_embedding(text)
+    
+    
+    
+    def _simulated_embedding(self, text: str) -> np.ndarray:
+    
+        """Create a simulated embedding based on text features."""
+    
+        import hashlib
+    
+        features = []
+    
+        
+    
+        # Length features
+    
+        features.append(len(text) / 100)
+    
+        features.append(len(text.split()) / 20)
+    
+        
+    
+        # Character distribution
+    
+        for char in 'aeiou':
+    
+            features.append(text.count(char) / max(len(text), 1))
+    
+        
+    
+        # Hash-based pseudo-random features
+    
+        text_hash = hashlib.md5(text.encode()).digest()
+    
+        for i in range(10):
+    
+            features.append(text_hash[i] / 255)
+    
+        
+    
+        # Pad to standard embedding size (1536 for OpenAI)
+    
+        while len(features) < 1536:
+    
+            features.append(0)
+    
+        
+    
+        return np.array(features[:1536])
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         """Calculate cosine similarity between two vectors."""
         return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
@@ -453,51 +522,42 @@ class ContextSimilarityMatcher:
         
         # Build context by adding messages until we hit limits
         context_messages = []
-        recent_chars = 0
-        long_term_chars = 0
-        
-        for item in similarities[:self.max_context_messages]:
+        total_chars = 0
+        max_total_chars = min_chars_recent + min_chars_long_term  # Use as total limit
+
+        # Add ALL messages with similarity > threshold, sorted by similarity
+        for item in similarities:  # No artificial limit on number of messages
             # Load the chunk for this gid
             chunk_content = self._load_chunk_by_gid(item["gid"])
             if not chunk_content:
                 continue
-            
-            content_length = len(chunk_content.get("content_text", ""))
-            
+
+            content_text = chunk_content.get("content_text", "")
+            content_length = len(content_text)
+
+            # Stop if adding this would exceed our total character limit
+            if total_chars + content_length > max_total_chars:
+                break
+
             # Determine if this is recent (within 7 days)
             is_recent = (datetime.now(timezone.utc) - item["timestamp"]).days <= 7
-            
-            if is_recent and recent_chars < min_chars_recent:
-                context_messages.append({
-                    "gid": item["gid"],
-                    "content": chunk_content.get("content_text", ""),
-                    "similarity": item["similarity"],
-                    "timestamp": item["timestamp"].isoformat(),
-                    "is_recent": True
-                })
-                recent_chars += content_length
-            
-            elif long_term_chars < min_chars_long_term:
-                context_messages.append({
-                    "gid": item["gid"],
-                    "content": chunk_content.get("content_text", ""),
-                    "similarity": item["similarity"],
-                    "timestamp": item["timestamp"].isoformat(),
-                    "is_recent": False
-                })
-                long_term_chars += content_length
-            
-            # Stop if we've hit both limits
-            if recent_chars >= min_chars_recent and long_term_chars >= min_chars_long_term:
-                break
+
+            context_messages.append({
+                "gid": item["gid"],
+                "content": content_text,
+                "similarity": item["similarity"],
+                "timestamp": item["timestamp"].isoformat(),
+                "is_recent": is_recent
+            })
+            total_chars += content_length
         
         metadata = {
             "current_labels": current_labels,
             "current_harmonized": current_harmonized,
             "total_similarities_found": len(similarities),
             "context_messages_included": len(context_messages),
-            "recent_chars": recent_chars,
-            "long_term_chars": long_term_chars,
+            "recent_chars": total_chars,
+            "long_term_chars": total_chars,
             "chunk_file": chunk_file,
             "label_file": label_file
         }

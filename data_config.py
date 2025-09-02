@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 # Base directories
-PROJECT_ROOT = Path("C:/BiggerBrother")
+PROJECT_ROOT = Path("C:/BiggerBrother-minimal")
 DATA_ROOT = PROJECT_ROOT / "data"
 ANALYSIS_ROOT = PROJECT_ROOT / "analysis_output"
 

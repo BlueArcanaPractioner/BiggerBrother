@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple, Any, Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import defaultdict
+import dotenv
 
 # Use app's OpenAI client (with API quirks handling)
 from app.openai_client import OpenAIClient
@@ -47,6 +48,8 @@ from assistant.behavioral_engine.logbooks.dynamic_logbook_system import (
     DetailedActivityLogger,
     LogBookAssistant
 )
+
+dotenv.load_dotenv()
 
 
 def ensure_timezone_aware(dt: Optional[datetime] = None) -> datetime:
@@ -105,7 +108,7 @@ class CompleteIntegratedSystem:
                 print(f"✅ Created {len(created)} missing directories")
 
             # Use configured paths
-            self.base_dir = str(Path("C:/BiggerBrother"))  # For compatibility
+            self.base_dir = str(Path("C:/BiggerBrother-minimal"))  # For compatibility
             chunks_dir = str(CHUNKS_DIR)
             labels_dir = str(LABELS_DIR)
             harmonizer_dir = str(HARMONIZER_DIR)
@@ -160,7 +163,7 @@ class CompleteIntegratedSystem:
         # Initialize the EnhancedLabelHarmonizer
         # No longer needs harmonization_report.json - works directly with two-tier files
         self.harmonizer = EnhancedLabelHarmonizer(
-            harmonization_report_path=f"{self.base_dir}/data/harmonization_report.json",  # Path for compatibility only
+            harmonization_report_path=f"{harmonizer_dir}/harmonization_report.json",  # Path for compatibility only
             similarity_threshold=0.80,  # For specific groups (>0.8)
             min_semantic_distance=0.5,  # For general groups (>0.5)
             use_real_embeddings=bool(os.getenv('OPENAI_API_KEY')),  # Use embeddings with smart filtering
@@ -256,7 +259,8 @@ class CompleteIntegratedSystem:
             labels_dir=labels_dir,
             chunks_dir=chunks_dir,
             harmonization_dir=harmonizer_dir,
-            openai_client=self.openai_client
+            openai_client=self.openai_client,
+            harmonizer=self.harmonizer
         )
 
         print(f"✅ Complete Integrated System initialized")
@@ -283,12 +287,12 @@ class CompleteIntegratedSystem:
 
     # ==================== NEW TWO-TIER CONTEXT METHODS ====================
 
-    def get_similar_messages_for_context(self, current_labels: Dict[str, List[Dict]], limit: int = 10) -> List[str]:
+    def get_similar_messages_for_context(self, message: str, current_labels: Dict[str, List[Dict]], limit: int = 10) -> List[str]:
         # Delegate to the new matcher
         context_messages, metadata = self.context_matcher.find_similar_messages(
-            message="",  # We already have labels, could refactor this
-            min_chars_recent=10000,
-            min_chars_long_term=50000
+            message=message,  # We already have labels, could refactor this
+            min_chars_recent=50000,
+            min_chars_long_term=150000
         )
         return [msg["content"] for msg in context_messages[:limit]]
 
@@ -362,13 +366,13 @@ class CompleteIntegratedSystem:
 
         if avg_similarity > 0.7:
             # High similarity - focused context
-            return categories, 3, 5
+            return categories, 3650, 36500
         elif avg_similarity < 0.3:
             # Low similarity - broad context
-            return categories, 7, 10
+            return categories, 3650, 36500
         else:
             # Medium similarity
-            return categories, 5, 7
+            return categories, 3650, 36500
 
     # ==================== UPDATED MAIN METHODS ====================
 
@@ -382,7 +386,17 @@ class CompleteIntegratedSystem:
         harmonized = self.harmonizer.process_label_set(raw_labels, message_context=message)
 
         # Find similar messages using probability-weighted similarity
-        similar_messages = self.get_similar_messages_for_context(harmonized, limit=5)
+        if hasattr(self, 'context_matcher'):
+            context_messages, metadata = self.context_matcher.find_similar_messages(
+                message,
+                min_chars_recent=50000,
+                min_chars_long_term=100000
+            )
+            similar_messages = [msg["content"] for msg in context_messages[:500000]]
+            print(f"   Found {len(context_messages)} similar messages for context")
+        else:
+            similar_messages = []
+            print("   No context matcher initialized")
 
         # Select categories and depth based on harmonized labels
         categories_needed, days_back, max_entries = self.select_context_categories_by_labels(harmonized)
@@ -488,6 +502,7 @@ class CompleteIntegratedSystem:
 
         response["labels_generated"] = self.labels_created_count - self.last_harmonization_count
 
+        print(f"{response}")
         if log_context:
             response["log_context_loaded"] = list(log_context.keys())
 
@@ -552,7 +567,7 @@ class CompleteIntegratedSystem:
                     {"role": "system", "content": extraction_prompt},
                     {"role": "user", "content": message}
                 ],
-                model="gpt-3.5-turbo"
+                model="gpt-5-nano"
             )
 
             # Parse response
@@ -624,7 +639,7 @@ class CompleteIntegratedSystem:
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": message}
                 ],
-                model="gpt-3.5-turbo"
+                model="gpt-5-nano"
             )
 
             # Parse and log
@@ -889,7 +904,7 @@ class CompleteIntegratedSystem:
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": message}
                 ],
-                model="gpt-3.5-turbo"
+                model="gpt-5-nano"
             )
 
             content = response.strip()
@@ -904,7 +919,7 @@ class CompleteIntegratedSystem:
     def start_detailed_activity_logging(self) -> Dict:
         """
         Start detailed activity logging with GPT-4o conversationalist
-        and GPT-3.5-turbo extractor.
+        and gpt-5-nano extractor.
         """
         session = self.activity_logger.start_detailed_logging()
         self.active_detailed_session = session
@@ -973,7 +988,7 @@ class CompleteIntegratedSystem:
 
     def propose_new_log_category(self, conversation_text: str) -> Optional[Dict]:
         """
-        Have GPT-3.5-turbo propose a new log category based on conversation.
+        Have gpt-5-nano propose a new log category based on conversation.
         """
         proposed = self.logbook.propose_category(conversation_text)
 
@@ -1000,8 +1015,8 @@ class CompleteIntegratedSystem:
         for category_name, category in self.logbook.categories.items():
             entries = self.logbook.load_category_context(
                 category_name,
-                days_back=1,
-                max_entries=50
+                days_back=365,
+                max_entries=500000
             )
 
             # Filter to today
@@ -1099,7 +1114,7 @@ Each subdirectory is a separate log category with:
 
 Categories are created dynamically based on:
 1. User requests
-2. GPT-3.5-turbo proposals from conversations
+2. gpt-5-nano proposals from conversations
 3. System defaults
 
 The system uses Two-Tier Harmonization:
