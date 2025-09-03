@@ -8,13 +8,18 @@ Run this to start the full system with email monitoring and notifications.
 
 FIXED VERSION: Now properly uses dual scheduler support for full functionality.
 """
-
+import collections
 import os
+import pathlib
 import sys
 import time
 import threading
 import logging
 from datetime import datetime, timezone, timedelta
+from email.header import Header
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr
 from pathlib import Path
 import pickle
 import json
@@ -44,6 +49,40 @@ from assistant.logger.unified import UnifiedLogger
 from assistant.graph.store import GraphStore
 from assistant.logger.temporal_personal_profile import TemporalPersonalProfile
 from app.openai_client import OpenAIClient
+
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]  # send+mark read; avoid /gmail.readonly if you modify
+BASE = pathlib.Path("secrets")  # up to you
+TOKEN = BASE / "token.json"
+CLIENT = BASE / "credentials.json"
+CHECKPOINT = pathlib.Path("run_state/processed_ids.json")
+MAX_IDS = 5000  # rolling window
+
+def load_processed():
+    try:
+        return collections.deque(json.loads(CHECKPOINT.read_text()), maxlen=MAX_IDS)
+    except Exception:
+        return collections.deque(maxlen=MAX_IDS)
+
+def save_processed(deq):
+    CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT.write_text(json.dumps(list(deq)))
+
+
+def gmail_service():
+    BASE.mkdir(parents=True, exist_ok=True)
+    creds = None
+    if TOKEN.exists():
+        creds = Credentials.from_authorized_user_file(str(TOKEN), SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT), SCOPES)
+            creds = flow.run_local_server(port=0)
+        # persist as JSON (not pickle)
+        with open(TOKEN, "w", encoding="utf-8") as f:
+            f.write(creds.to_json())
+    return build("gmail", "v1", credentials=creds)
 
 
 class ConversationMode(Enum):
@@ -131,6 +170,9 @@ class GmailIntegration:
             return []
 
 
+
+
+
     def _extract_body(self, payload):
         """Extract text body from message payload with HTML fallback."""
         body = ""
@@ -170,39 +212,39 @@ class GmailIntegration:
         """Best-effort HTML → text without extra deps."""
         import re
         from html import unescape
-        s = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", "", html)  # drop scripts/styles
-        s = re.sub(r"(?i)<br\\s*/?>", "\n", s)                      # <br> → newline
-        s = re.sub(r"(?i)</p\\s*>", "\n\n", s)                      # </p> → blank line
+        s = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", html)  # drop scripts/styles
+        s = re.sub(r"(?i)<br\s*/?>", "\n", s)                      # <br> → newline
+        s = re.sub(r"(?i)</p\s*>", "\n\n", s)                      # </p> → blank line
         s = re.sub(r"<[^>]+>", "", s)                               # strip tags
         s = unescape(s)
         # normalize whitespace
         return "\n".join(line.strip() for line in s.splitlines() if line.strip())
 
+    def send_email(self, service, to_addr, subject, text_body, html_body=None, from_name=None, thread_id=None):
+        if html_body:
+            msg = MIMEMultipart("alternative")
+            msg.attach(MIMEText(text_body or "", "plain", "utf-8"))
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
+        else:
+            msg = MIMEText(text_body or "", "plain", "utf-8")
 
-    def send_email(self, to, subject, body, thread_id=None):
-        """Send an email."""
-        try:
-            message = {
-                'raw': base64.urlsafe_b64encode(
-                    f"To: {to}\r\n"
-                    f"Subject: {subject}\r\n"
-                    f"\r\n{body}".encode()
-                ).decode()
-            }
+        # optional friendly display name
+        if from_name:
+            msg["From"] = formataddr((str(Header(from_name, "utf-8")), "me"))
+        else:
+            msg["From"] = "me"  # Gmail API will resolve ‘me’ to the authenticated account
 
-            if thread_id:
-                message['threadId'] = thread_id
+        msg["To"] = to_addr
+        msg["Subject"] = str(Header(subject or "", "utf-8"))
 
-            self.service.users().messages().send(
-                userId='me', body=message
-            ).execute()
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+        body = {"raw": raw}
+        if thread_id:
+            body["threadId"] = thread_id
 
-            return True
-        except Exception as e:
-            print(f"Error sending email: {e}")
-            return False
+        return service.users().messages().send(userId="me", body=body).execute()
 
-    def mark_as_read(self, msg_id):
+    def mark_as_read(self, service, msg_id):
         """Mark message as read."""
         try:
             self.service.users().messages().modify(

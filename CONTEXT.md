@@ -2,11 +2,11 @@
 
 ## Summary
 - **Files**: 38 Python files
-- **Lines**: 16,907 total lines
+- **Lines**: 17,328 total lines
 - **Classes**: 65 classes
-- **Functions**: 488 functions/methods
+- **Functions**: 499 functions/methods
 - **Main Packages**: app, assistant
-- **External Dependencies**: __future__, app, argparse, assistant, base64, csv, data_config, difflib, dotenv, email, glob, google, google_auth_oauthlib, googleapiclient, jsonschema, label_generator, logging, numpy, openai, openai_client, pickle, platform, plyer, requests, schedule, smtplib, statistics, threading, traceback
+- **External Dependencies**: __future__, app, argparse, assistant, base64, csv, data_config, difflib, dotenv, email, glob, google, google_auth_oauthlib, googleapiclient, html, jsonschema, label_generator, logging, numpy, openai, openai_client, pickle, platform, plyer, pydantic_core, requests, schedule, smtplib, statistics, tempfile, threading, traceback
 
 ## Architecture Patterns
 - Type hints: ✓
@@ -94,8 +94,8 @@ class CoverageChecker:
 Imports: `__future__.annotations, dotenv.load_dotenv, openai, openai.OpenAI`
 ```python
 class OpenAIClient:
-    def __init__(self) -> None
-    def chat(self, messages: list[dict], model: BinOp=None, **kwargs) -> str
+    def __init__(self, raise_on_fail: BinOp=None) -> None
+    def chat(self, **kwargs) -> str
     def complete(self, prompt: str, model: BinOp=None, **kwargs) -> str
 ```
 
@@ -104,7 +104,7 @@ class OpenAIClient:
 **`assistant\behavioral_engine\context\similarity_matcher.py`**
 _Context Similarity Matcher for BiggerBrother_
 📥 Reads: `<cache_file>, <chunk_file>`
-📤 Writes: `<tier>`
+📤 Writes: `<dynamic>, <tier>`
 📁 Uses: `<header_parts>, data/`
 Imports: `__future__.annotations, app.label_integration_wrappers.LabelGenerator, app.openai_client.OpenAIClient, assistant.importers.enhanced_smart_label_importer.EnhancedLabelHarmonizer, collections.defaultdict`
 ```python
@@ -132,7 +132,7 @@ class CompleteIntegratedSystem:
     def analyze_behavioral_patterns(self, days: int=30)
     def generate_daily_schedule(self, date=None)
     def schedule_pomodoro(self, task: str, start_time=None, duration=25, break_duration=5)
-    def needs_harmonization(self, threshold: int=100) -> bool
+    def needs_harmonization(self, threshold: int=1) -> bool
     def reset_harmonization_counter(self)
     def rebuild_two_tier_groups(self) -> Dict
     def get_harmonization_insights(self) -> Dict
@@ -149,7 +149,7 @@ class CompleteIntegratedSystem:
 **`assistant\behavioral_engine\enhanced_gmail_runner.py`**
 _BiggerBrother Complete System with Gmail OAuth Integration_
 📥 Reads: `<dynamic>`
-📁 Uses: `<metadata>, <parts>`
+📁 Uses: `<metadata>, <parts>, <text_html>`
 Imports: `app.openai_client.OpenAIClient, assistant.behavioral_engine.core.complete_system.CompleteIntegratedSystem, assistant.behavioral_engine.schedulers.adaptive_scheduler.AdaptiveScheduler, assistant.behavioral_engine.schedulers.notification_integration.NotificationConfig, assistant.behavioral_engine.schedulers.notification_integration.NotificationManager`
 ```python
 class ConversationMode(Enum):
