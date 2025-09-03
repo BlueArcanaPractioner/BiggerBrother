@@ -8,6 +8,8 @@ Combines string matching and embeddings to minimize API calls.
 
 import json
 import os
+import time
+
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional, Any
@@ -101,6 +103,8 @@ class EnhancedLabelHarmonizer:
         }
         self.embedding_cache = {}
         self.co_occurrence = defaultdict(lambda: defaultdict(Counter))
+        # Similarity cache for batch mode
+        self.similarity_cache = {}
 
         # OpenAI client if available
         if self.use_real_embeddings:
@@ -119,6 +123,11 @@ class EnhancedLabelHarmonizer:
 
         # Load original harmonization report if it exists
         self._load_original_report()
+
+        self.debug_verbose = os.getenv("BB_DEBUG_VERBOSE", "0") == "1"
+        self._dbg = (
+            lambda m: print(f"[harmonizer][{datetime.now(timezone.utc).isoformat()}] {m}")) if self.debug_verbose else (
+            lambda *_: None)
 
     
     def enable_batch_mode(self):
@@ -230,23 +239,27 @@ class EnhancedLabelHarmonizer:
             for category in ['topic', 'tone', 'intent']:
                 groups_dict[category] = {}
 
+    def get_embedding(self, text: str):
+        return self._get_embedding(text)
 
     def _get_embedding(self, text: str) -> np.ndarray:
         """Get embedding for text (cached or compute)."""
         if text in self.embedding_cache:
+            self._dbg(f"embed cache HIT for '{text[:48]}'")
             # Debug: cached embedding found
             return self.embedding_cache[text]
 
         if self.use_real_embeddings:
             try:
+                t0 = time.time()
                 response = self.openai_client.embeddings.create(
                     model="text-embedding-3-small",
                     input=text
                 )
-                print(response)
                 embedding = np.array(response.data[0].embedding)
+                self._dbg(f"embed API CALL for '{text[:48]}' took {time.time() - t0:.3f}s")
             except Exception as e:
-                logger.debug(f"Error getting embedding: {e}")
+                self._dbg(f"embed API FAILED for '{text[:48]}': {e}; falling back to simulated embedding")
                 embedding = self._simulated_embedding(text)
         else:
             embedding = self._simulated_embedding(text)

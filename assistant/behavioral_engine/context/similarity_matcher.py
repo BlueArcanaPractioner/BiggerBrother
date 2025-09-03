@@ -9,15 +9,16 @@ tier weights, and recency bias to build optimal context headers.
 from __future__ import annotations
 import json
 import os
+import math
+import time
 import hashlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict
 import numpy as np
+import re
 import tempfile, pickle
-
-from pydantic_core.core_schema import none_schema
 
 from app.openai_client import OpenAIClient
 from app.label_integration_wrappers import LabelGenerator
@@ -41,12 +42,12 @@ class ContextSimilarityMatcher:
         # Context size parameters
         context_minimum_char_long_term: int = 150000,
         context_minimum_char_recent: int = 50000,
-        max_context_messages: int = 500000,
+        max_context_messages: int = 50000,
         # Weighting parameters
         general_tier_weight: float = 0.3,
         specific_tier_weight: float = 0.7,
         recency_decay_factor: float = 0.998,  # Per day decay
-        recency_cutoff_days: int = 3650,
+        recency_cutoff_days: int = 1000,
     ):
         """
         Initialize the similarity matcher.
@@ -71,6 +72,10 @@ class ContextSimilarityMatcher:
         self.openai_client = openai_client or OpenAIClient()
         self.label_generator = LabelGenerator(self.openai_client)
         self.harmonizer = harmonizer
+
+        # Embedding cache file: unify with harmonizer if available
+        if self.harmonizer and hasattr(self.harmonizer, "embedding_cache_file"):
+            self.embedding_cache_file = self.harmonization_dir / 'embedding_cache.pkl'
         
         # Context parameters
         self.context_minimum_char_long_term = context_minimum_char_long_term
@@ -94,6 +99,41 @@ class ContextSimilarityMatcher:
         # Cache for embeddings
         self.embedding_cache = {}
         self._load_embedding_cache()
+
+        # Debug knobs (env-driven so you don't have to change code)
+        self.debug_verbose = os.getenv("BB_DEBUG_VERBOSE", "0") == "1"
+        self.debug_string_only = os.getenv("BB_MATCHER_STRING_ONLY", "0") == "1"
+        self.debug_max_groups = int(os.getenv("BB_DEBUG_MAX_GROUPS", "500"))
+        self.debug_step = int(os.getenv("BB_DEBUG_STEP", "50"))
+
+        self.gen_thr = float(os.getenv("BB_THR_GENERAL", "0.5"))
+        self.spec_thr = float(os.getenv("BB_THR_SPECIFIC", "0.8"))
+        self.gen_thr_str = float(os.getenv("BB_THR_GENERAL_STR", "0.35"))
+        self.spec_thr_str = float(os.getenv("BB_THR_SPECIFIC_STR", "0.6"))
+
+        def _dbg(msg: str):
+            if self.debug_verbose:
+                print(f"[matcher][{datetime.now(timezone.utc).isoformat()}] {msg}")
+        self._dbg = _dbg
+
+
+        # Light-weight synonym map (can be extended via JSON file)
+        self.synonyms = {
+            # intent (general)
+            "schedule_meeting": "scheduling",
+            "set_appointment": "scheduling",
+            "arrange_meeting": "scheduling",
+            "book_appointment": "scheduling",
+            "reschedule": "scheduling",
+            "calendar_event": "scheduling",
+        }
+        syn_file = Path(os.getenv("BB_LABEL_SYNONYMS", "data/label_synonyms.json"))
+        if syn_file.exists():
+            try:
+                self.synonyms.update(json.loads(syn_file.read_text(encoding="utf-8")))
+                self._dbg(f"loaded {len(self.synonyms)} synonyms")
+            except Exception as e:
+                self._dbg(f"failed to load synonyms: {e}")
     
     def _load_harmonization_tier(self, tier: str) -> Dict:
         """Load a harmonization tier file."""
@@ -125,7 +165,7 @@ class ContextSimilarityMatcher:
     
     def _load_embedding_cache(self):
         """Load cached embeddings if available."""
-        cache_file = self.harmonization_dir / "embedding_cache.pkl"
+        cache_file = getattr(self, "embedding_cache_file", self.harmonization_dir / "embedding_cache.pkl")
         if cache_file.exists():
             import pickle
             try:
@@ -136,7 +176,7 @@ class ContextSimilarityMatcher:
 
     def _save_embedding_cache(self):
         """Save embedding cache atomically."""
-        cache_file = self.harmonization_dir / "embedding_cache.pkl"
+        cache_file = getattr(self, "embedding_cache_file", self.harmonization_dir / "embedding_cache.pkl")
         cache_file.parent.mkdir(parents=True, exist_ok=True)
 
         fd, tmp_path = tempfile.mkstemp(
@@ -300,17 +340,34 @@ class ContextSimilarityMatcher:
         Returns:
             Best matching group or None
         """
-        threshold = 0.5 if tier == "general" else 0.8
+        threshold = (self.gen_thr if tier == "general" else self.spec_thr)
+        if self.debug_string_only:
+            threshold = (self.gen_thr_str if tier == "general" else self.spec_thr_str)
         groups = self.general_groups if tier == "general" else self.specific_groups
         category_groups = groups.get(category, {}).get("groups", {})
         
         if not category_groups:
             return None
-        
-        # Get embedding for the label
-        label_embedding = self._get_embedding(label)
+
+        t0 = time.time()
+        n_groups = len(category_groups)
+        self._dbg(
+            f"_find_best_group start tier={tier} cat={category} label='{label}' groups={n_groups} thr={threshold} string_only={self.debug_string_only}")
+        # 0) synonym shortcut (string-normalized)
+        norm_label = self._normalize_label(label)
+        syn_target = self.synonyms.get(norm_label)
+        if syn_target and syn_target in category_groups:
+            self._dbg(f"_find_best_group: synonym shortcut '{label}' -> '{syn_target}'")
+            return syn_target
+
+
+        # Get embedding for the label (unless in string-only debug mode)
+        label_embedding = None
+        if not self.debug_string_only:
+            label_embedding = self._get_embedding(label)
         if label_embedding is None:
-            return None
+            self._dbg(f"_find_best_group: label embedding unavailable; falling back to string similarity")
+
         
         # Sort groups by frequency (size) for checking highest frequency first
         sorted_groups = sorted(
@@ -321,22 +378,72 @@ class ContextSimilarityMatcher:
         
         best_similarity = 0
         best_group = None
-        
+
+        checked = 0
         for canonical, variants in sorted_groups:
-            # Get embedding for canonical label
-            canonical_embedding = self._get_embedding(canonical)
-            if canonical_embedding is None:
-                continue
-            
-            # Calculate cosine similarity
-            similarity = self._cosine_similarity(label_embedding, canonical_embedding)
+            checked += 1
+            if self.debug_max_groups and self.debug_max_groups > 0 and checked > self.debug_max_groups:
+                self._dbg(f"_find_best_group: abort after {self.debug_max_groups} groups (cap). best={best_group} sim={best_similarity:.3f}")
+                break
+
+            # Similarity against a single representative: canonical string
+            if self.debug_string_only or label_embedding is None:
+                # combine token and trigram similarity
+                similarity = max(
+                    self._token_jaccard(self._tokens(norm_label), self._tokens(self._normalize_label(canonical))),
+                    self._string_similarity_quick(norm_label, self._normalize_label(canonical)),
+                )
+            else:
+                canonical_embedding = self._get_embedding(canonical)
+                if canonical_embedding is None:
+                    continue
+                similarity = self._cosine_similarity(label_embedding, canonical_embedding)
+
             
             if similarity >= threshold and similarity > best_similarity:
                 best_similarity = similarity
                 best_group = canonical
+                if checked % max(1, self.debug_step) == 0 or self.debug_verbose:
+                    self._dbg(f"_find_best_group: new best '{best_group}' @ {best_similarity:.3f} (checked={checked}/{n_groups})")
         
         return best_group
-    
+
+    def _normalize_label(self, s: str) -> str:
+        return (s or "").strip().lower().replace("-", "_")
+
+    def _tokens(self, s: str) -> set[str]:
+        # split on non-alphanum and underscores; drop empties; simple stem-ish suffix trim
+        toks = [t for t in re.split(r"[^a-z0-9]", s) if t]
+        # tiny heuristic stems for common action nouns/verbs
+        stems = []
+        for t in toks:
+            if t.endswith("ing") and len(t) > 5: t = t[:-3]
+            elif t.endswith("ed") and len(t) > 4: t = t[:-2]
+            elif t.endswith("tion") and len(t) > 6: t = t[:-4]
+            stems.append(t)
+        return set(stems)
+
+    def _token_jaccard(self, A: set[str], B: set[str]) -> float:
+        if not A or not B:
+            return 0.0
+        inter = len(A & B)
+        union = len(A | B) or 1
+        return inter / union
+
+    def _string_similarity_quick(self, a: str, b: str) -> float:
+        """
+        Very fast, order-of-magnitude string similarity for debug mode.
+        Jaccard on 3-grams; returns 0..1.
+        """
+        a = (a or "").lower()
+        b = (b or "").lower()
+        if not a or not b:
+            return 0.0
+        A = {a[i:i+3] for i in range(max(1, len(a)-2))}
+        B = {b[i:i+3] for i in range(max(1, len(b)-2))}
+        inter = len(A & B)
+        union = len(A | B) or 1
+        return inter / union
         
     def _get_embedding(self, text: str) -> Optional[np.ndarray]:
         """
@@ -346,7 +453,7 @@ class ContextSimilarityMatcher:
         vec = self.embedding_cache.get(text)
         if vec is not None:
             return vec
-        vec = self.harmonizer._get_embedding(text)
+        vec = self.harmonizer.get_embedding(text)
         if vec is None:
             return None
         self.embedding_cache[text] = vec
@@ -641,14 +748,29 @@ class ContextSimilarityMatcher:
         min_chars_long_term = min_chars_long_term or self.context_minimum_char_long_term
 
         # Setup
+        t0 = time.time()
+        self._dbg("begin finding similar messages")
         self._load_two_tier_maps()
+        self._dbg(f"loaded two-tier maps in {time.time() - t0:.3f}s")
         now = datetime.now(timezone.utc)
 
         # Current labels → canonical (specific)
+        t1 = time.time()
         current_labels = self.get_message_labels(message)
+        # Robust summary for debug: count only containers; show scalars as-is
+        if self.debug_verbose:
+            summary = {}
+            for k, v in (current_labels or {}).items():
+                if isinstance(v, (list, tuple, set, dict)):
+                    summary[k] = len(v)
+                else:
+                    summary[k] = v
+            self._dbg(f"get_message_labels -> {summary} in {time.time() - t1:.3f}s")
+        ct0=time.time()
         cur_topics = self._canonicalize_label_list(current_labels.get("topic", []), "topic", tier="specific")
         cur_tones = self._canonicalize_label_list(current_labels.get("tone", []), "tone", tier="specific")
         cur_intents = self._canonicalize_label_list(current_labels.get("intent", []), "intent", tier="specific")
+        self._dbg(f"canonicalized: topics={len(cur_topics)}, tones={len(cur_tones)}, intents={len(cur_intents)} in {time.time()-t0:.3f}s")
 
         # Create files for current message
         chunk_file, label_file = self._create_message_files(message, current_labels)
@@ -695,6 +817,7 @@ class ContextSimilarityMatcher:
         _cur_v_tone = _cat_vec(cur_tones)
         _cur_v_intent = _cat_vec(cur_intents)
 
+        self._dbg("begin candidate scan")
         similarities: List[Dict] = []
         for label_file_path in self.labels_dir.glob("*.json"):
             try:
@@ -768,7 +891,7 @@ class ContextSimilarityMatcher:
             except Exception as e:
                 print(f"[ctx] Error processing {label_file_path}: {e}")
                 continue
-
+        self._dbg("end candidate scan")
         # Sort & build context within budgets
         similarities.sort(key=lambda x: x["similarity"], reverse=True)
 
