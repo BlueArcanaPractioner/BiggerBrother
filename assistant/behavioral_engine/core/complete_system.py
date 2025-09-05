@@ -515,7 +515,7 @@ class CompleteIntegratedSystem:
 
         response["labels_generated"] = self.labels_created_count - self.last_harmonization_count
 
-        print(f"{response}")
+        #print(f"{response}")
         if log_context:
             response["log_context_loaded"] = list(log_context.keys())
 
