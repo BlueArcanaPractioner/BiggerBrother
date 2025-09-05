@@ -49,6 +49,8 @@ from assistant.logger.unified import UnifiedLogger
 from assistant.graph.store import GraphStore
 from assistant.logger.temporal_personal_profile import TemporalPersonalProfile
 from app.openai_client import OpenAIClient
+from assistant.behavioral_engine.schedulers.intelligent_scheduler import IntelligentSchedulingSystem
+from assistant.behavioral_engine.schedulers.intelligent_scheduler import ScheduleIntentType
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]  # send+mark read; avoid /gmail.readonly if you modify
 BASE = pathlib.Path("secrets")  # up to you
@@ -220,7 +222,17 @@ class GmailIntegration:
         # normalize whitespace
         return "\n".join(line.strip() for line in s.splitlines() if line.strip())
 
-    def send_email(self, service, to_addr, subject, text_body, html_body=None, from_name=None, thread_id=None):
+    def send_email(self, to=None, to_addr=None, subject="", body=None, text_body=None, html_body=None, html=None,
+                   from_name=None, thread_id=None, service=None):
+        """
+        Backwards-compatible Gmail send. Accepts both (to, subject, body) and (to_addr, subject, text_body),
+        and optionally a 'service'. Falls back to self.service.
+        """
+        service = service or self.service
+        to_addr = to_addr or to
+        text_body = text_body or body
+        if html is not None and html_body is None:
+            html_body = html
         if html_body:
             msg = MIMEMultipart("alternative")
             msg.attach(MIMEText(text_body or "", "plain", "utf-8"))
@@ -244,16 +256,28 @@ class GmailIntegration:
 
         return service.users().messages().send(userId="me", body=body).execute()
 
-    def mark_as_read(self, service, msg_id):
+    def mark_as_read(self, msg_id, service=None):
         """Mark message as read."""
         try:
-            self.service.users().messages().modify(
+            (service or self.service).users().messages().modify(
                 userId='me',
                 id=msg_id,
                 body={'removeLabelIds': ['UNREAD']}
             ).execute()
         except Exception as e:
             print(f"Error marking as read: {e}")
+
+    def _extract_message_data(self, full_msg):
+        """Normalize a Gmail API message resource to a friendly dict."""
+        payload = full_msg.get('payload', {})
+        headers = {h['name']: h['value'] for h in payload.get('headers', [])}
+        return {
+            'id': full_msg.get('id'),
+            'thread_id': full_msg.get('threadId'),
+            'from': headers.get('From', ''),
+            'subject': headers.get('Subject', ''),
+            'body': self._extract_body(payload)
+        }
 
 
 class BiggerBrotherEmailSystem:
@@ -335,6 +359,16 @@ class BiggerBrotherEmailSystem:
         # Chat mode context tracking
         self.chat_contexts = {}
 
+        # Initialize Intelligent Scheduling System
+        self.scheduling_system = IntelligentSchedulingSystem(
+            openai_client=self.system.openai_client,
+            complete_system=None,  # Will be set next
+            base_dir=self.base_dir
+        )
+        # Set references to avoid circular imports
+        self.scheduling_system.set_complete_system(self.system)
+        self.scheduling_system.email_system = self
+
         # Email monitoring thread
         self.email_thread = None
 
@@ -404,7 +438,7 @@ class BiggerBrotherEmailSystem:
     def _process_email(self, msg):
         """Process an incoming email with mode awareness."""
         self.logger.info(f"📨 Processing email: {msg['subject']}")
-
+        import re
         from_email = re.search(r'<(.+?)>', msg['from'])
         from_addr = from_email.group(1) if from_email else msg['from']
         body = msg['body'].strip()
@@ -412,55 +446,81 @@ class BiggerBrotherEmailSystem:
         response = None
         current_mode = self._get_conversation_mode(from_addr)
 
-        # Check for mode-specific commands first
-        if current_mode != ConversationMode.QUICK_LOG:
-            # Handle ongoing conversation
-            if re.search(r'\b(done|exit|bye|stop)\b', body, re.IGNORECASE):
-                response = self._end_conversation(from_addr)
+        # Check for scheduling session confirmations
+        if 'Session:' in body:
+            # Extract session ID
+            import re
+            session_match = re.search(r'Session:\s*([^\s]+)', body)
+            if session_match:
+                session_id = session_match.group(1)
+                # Check if this is a pending confirmation
+                for full_id in self.scheduling_system.pending_confirmations:
+                    if full_id.startswith(session_id):
+                        result = self.scheduling_system.confirm_schedule(full_id, body)
+                        response = result.get('message', result.get('response', 'Schedule updated'))
+                        break
+
+        # 1) Try intelligent scheduling on every inbound first
+        if not response:
+            try:
+                sched = self.scheduling_system.process_message(body, source='email')
+                if sched.get('scheduling', {}).get('intent_detected'):
+                    response = sched['scheduling']['response']
+            except Exception as e:
+                self.logger.error(f"Scheduling parse error: {e}")
+
+        # 2) If no response yet, continue with normal processing
+        if not response:
+
+            # Check for mode-specific commands first
+            if current_mode != ConversationMode.QUICK_LOG:
+                # Handle ongoing conversation
+                if re.search(r'\b(done|exit|bye|stop)\b', body, re.IGNORECASE):
+                    response = self._end_conversation(from_addr)
+                else:
+                    response = self._continue_conversation(from_addr, body, current_mode)
+
+            # Check for new conversation starters
+            elif re.search(r'\b(chat|talk|conversation)\b', body, re.IGNORECASE):
+                response = self._start_chat_mode(from_addr)
+
+            elif re.search(r'\b(checkin|check-in|start)\b', body, re.IGNORECASE):
+                response = self._start_checkin_mode(from_addr)
+
+            elif re.search(r'\b(detailed|activity|logging)\b', body, re.IGNORECASE):
+                response = self._start_detailed_mode(from_addr)
+
+            elif re.search(r'\b(help|commands?)\b', body, re.IGNORECASE):
+                response = self._get_help_text()
+
+            elif re.search(r'\b(status|summary|report)\b', body, re.IGNORECASE):
+                response = self._get_status_summary()
+
+            elif re.search(r'\b(skip|later|postpone|no)\b', body, re.IGNORECASE):
+                response = "Check-in skipped. I'll check with you later."
+
+            elif match := re.search(r'\bpomodoro\s+(.+)', body, re.IGNORECASE):
+                # Use adaptive_scheduler for pomodoro
+                task = match.group(1)
+                session = self.adaptive_scheduler.schedule_pomodoro(task)
+                response = f"🍅 Pomodoro started for: {task}\nEnds at {session.end_time.strftime('%H:%M')}"
+
+            # Default: quick log
             else:
-                response = self._continue_conversation(from_addr, body, current_mode)
+                result = self.system.process_message_with_context(body)
+                response = self._format_quick_log_response(result)
 
-        # Check for new conversation starters
-        elif re.search(r'\b(chat|talk|conversation)\b', body, re.IGNORECASE):
-            response = self._start_chat_mode(from_addr)
+            # Send response if needed
+            if response:
+                self.gmail.send_email(
+                    to=from_addr,
+                    subject=f"Re: {msg['subject']}",
+                    body=response,
+                    thread_id=msg['threadId']
+                )
 
-        elif re.search(r'\b(checkin|check-in|start)\b', body, re.IGNORECASE):
-            response = self._start_checkin_mode(from_addr)
-
-        elif re.search(r'\b(detailed|activity|logging)\b', body, re.IGNORECASE):
-            response = self._start_detailed_mode(from_addr)
-
-        elif re.search(r'\b(help|commands?)\b', body, re.IGNORECASE):
-            response = self._get_help_text()
-
-        elif re.search(r'\b(status|summary|report)\b', body, re.IGNORECASE):
-            response = self._get_status_summary()
-
-        elif re.search(r'\b(skip|later|postpone|no)\b', body, re.IGNORECASE):
-            response = "Check-in skipped. I'll check with you later."
-
-        elif match := re.search(r'\bpomodoro\s+(.+)', body, re.IGNORECASE):
-            # Use adaptive_scheduler for pomodoro
-            task = match.group(1)
-            session = self.adaptive_scheduler.schedule_pomodoro(task)
-            response = f"🍅 Pomodoro started for: {task}\nEnds at {session.end_time.strftime('%H:%M')}"
-
-        # Default: quick log
-        else:
-            result = self.system.process_message_with_context(body)
-            response = self._format_quick_log_response(result)
-
-        # Send response if needed
-        if response:
-            self.gmail.send_email(
-                to=from_addr,
-                subject=f"Re: {msg['subject']}",
-                body=response,
-                thread_id=msg['threadId']
-            )
-
-        # Mark as read
-        self.gmail.mark_as_read(msg['id'])
+            # Mark as read
+            self.gmail.mark_as_read(msg['id'])
 
     def _start_chat_mode(self, from_addr):
         """Start a 'just chatting' conversation mode."""
@@ -558,6 +618,13 @@ Describe your activities in detail and I'll extract and categorize everything.
                 'timestamp': datetime.now(timezone.utc).isoformat()
             })
 
+        # Scheduling intent intercept
+        try:
+            sched = self.scheduling_system.process_message(message, source='chat')
+            if sched.get('scheduling', {}).get('intent_detected'):
+                return sched['scheduling']['response']
+        except Exception:
+            pass
         # Process with context awareness (uses context scheduler internally)
         result = self.system.process_message_with_context(message)
 
@@ -615,6 +682,12 @@ Respond naturally and explore the topic deeply. Ask thoughtful follow-up questio
 
     def _continue_checkin(self, from_addr, message):
         """Continue a check-in conversation (uses context scheduler internally)."""
+        try:
+            sched = self.scheduling_system.process_message(message, source='checkin')
+            if sched.get('scheduling', {}).get('intent_detected'):
+                return sched['scheduling']['response']
+        except Exception:
+            pass
         result = self.system.process_message_with_context(message)
 
         response = result.get('response', 'Got it!')
@@ -839,7 +912,7 @@ System Features:
 
         try:
             while self.running:
-                print("\n[1=quick, 2=check-in, 3=chat, 4=status, 5=test, 6=harmonize, 7=patterns, h=help, q=quit]")
+                print("\n[1=quick, 2=check-in, 3=chat, 4=status, 5=test, 6=harmonize, 7=patterns, 8=schedule, h=help, q=quit]")
 
                 choice = input("> ").strip().lower()
 
@@ -995,6 +1068,22 @@ System Features:
                     print(f"\n📅 Today's Schedule:")
                     for item in schedule[:5]:
                         print(f"   {item.scheduled_time.strftime('%H:%M')} - {item.check_in_type.value}")
+
+                elif choice == '8':
+                    # Test scheduling
+                    message = input("What do you need to schedule? ")
+                    result = self.scheduling_system.process_message(message)
+
+                    if result.get('scheduling', {}).get('intent_detected'):
+                        print(f"\n{result['scheduling']['response']}")
+
+                        # Get confirmation
+                        confirm = input("\nYour choice: ")
+                        session_id = result['scheduling']['session_id']
+                        confirmation = self.scheduling_system.confirm_schedule(session_id, confirm)
+                        print(f"\n{confirmation.get('message', 'Updated')}")
+                    else:
+                        print("No scheduling intent detected")
 
                 elif choice == 'h':
                     print(self._get_help_text())

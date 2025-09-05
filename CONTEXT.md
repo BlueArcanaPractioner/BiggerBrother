@@ -1,12 +1,12 @@
 # BiggerBrother Codebase Context
 
 ## Summary
-- **Files**: 38 Python files
-- **Lines**: 17,328 total lines
-- **Classes**: 65 classes
-- **Functions**: 499 functions/methods
+- **Files**: 44 Python files
+- **Lines**: 18,486 total lines
+- **Classes**: 73 classes
+- **Functions**: 551 functions/methods
 - **Main Packages**: app, assistant
-- **External Dependencies**: __future__, app, argparse, assistant, base64, csv, data_config, difflib, dotenv, email, glob, google, google_auth_oauthlib, googleapiclient, html, jsonschema, label_generator, logging, numpy, openai, openai_client, pickle, platform, plyer, pydantic_core, requests, schedule, smtplib, statistics, tempfile, threading, traceback
+- **External Dependencies**: __future__, app, argparse, assistant, base64, csv, data_config, difflib, dotenv, email, faulthandler, glob, google, google_auth_oauthlib, googleapiclient, html, jsonschema, label_generator, logging, numpy, openai, openai_client, pickle, platform, plyer, requests, schedule, smtplib, statistics, tempfile, threading, traceback, tracemalloc, types
 
 ## Architecture Patterns
 - Type hints: ✓
@@ -91,12 +91,13 @@ class CoverageChecker:
 ```
 
 **`app\openai_client.py`**
-Imports: `__future__.annotations, dotenv.load_dotenv, openai, openai.OpenAI`
+Imports: `__future__.annotations, dotenv.load_dotenv, hashlib, openai, openai.OpenAI`
 ```python
 class OpenAIClient:
     def __init__(self, raise_on_fail: BinOp=None) -> None
     def chat(self, **kwargs) -> str
     def complete(self, prompt: str, model: BinOp=None, **kwargs) -> str
+    def embed(self, inputs: t.Union[Tuple], model: BinOp=None, dim: int=1536) -> list[list[float]]
 ```
 
 ### assistant/
@@ -108,8 +109,10 @@ _Context Similarity Matcher for BiggerBrother_
 📁 Uses: `<header_parts>, data/`
 Imports: `__future__.annotations, app.label_integration_wrappers.LabelGenerator, app.openai_client.OpenAIClient, assistant.importers.enhanced_smart_label_importer.EnhancedLabelHarmonizer, collections.defaultdict`
 ```python
+class PhaseTimer:
+    def __init__(self, name: str, sink: Dict[Tuple])
 class ContextSimilarityMatcher:
-    def __init__(self, labels_dir: str='labels', chunks_dir: str='data/chunks', harmonization_dir: str='data', openai_client: Optional[OpenAIClient]=None, harmonizer: Optional[EnhancedLabelHarmonizer]=None, context_minimum_char_long_term: int=150000, context_minimum_char_recent: int=50000, max_context_messages: int=500000, general_tier_weight: float=0.3, specific_tier_weight: float=0.7, recency_decay_factor: float=0.998, recency_cutoff_days: int=3650)
+    def __init__(self, labels_dir: str='labels', chunks_dir: str='data/chunks', harmonization_dir: str='data', openai_client: Optional[OpenAIClient]=None, harmonizer: Optional[EnhancedLabelHarmonizer]=None, context_minimum_char_long_term: int=150000, context_minimum_char_recent: int=50000, max_context_messages: int=50000, general_tier_weight: float=0.3, specific_tier_weight: float=0.7, recency_decay_factor: float=0.998, recency_cutoff_days: int=1000)
     def get_message_labels(self, message: str) -> Dict
     def harmonize_and_score_labels(self, labels: Dict) -> Dict
     def calculate_similarity_score(self, current_harmonized: Dict, target_harmonized: Dict, message_timestamp: datetime) -> float
@@ -148,7 +151,8 @@ class CompleteIntegratedSystem:
 
 **`assistant\behavioral_engine\enhanced_gmail_runner.py`**
 _BiggerBrother Complete System with Gmail OAuth Integration_
-📥 Reads: `<dynamic>`
+📥 Reads: `<TOKEN>, <dynamic>`
+📤 Writes: `<creds.to_json()>, <json.dumps()>`
 📁 Uses: `<metadata>, <parts>, <text_html>`
 Imports: `app.openai_client.OpenAIClient, assistant.behavioral_engine.core.complete_system.CompleteIntegratedSystem, assistant.behavioral_engine.schedulers.adaptive_scheduler.AdaptiveScheduler, assistant.behavioral_engine.schedulers.notification_integration.NotificationConfig, assistant.behavioral_engine.schedulers.notification_integration.NotificationManager`
 ```python
@@ -156,8 +160,8 @@ class ConversationMode(Enum):
 class GmailIntegration:
     def __init__(self, credentials_file='credentials.json', token_file='token.pickle')
     def get_unread_messages(self, query='is:unread subject:BiggerBrother')
-    def send_email(self, to, subject, body, thread_id=None)
-    def mark_as_read(self, msg_id)
+    def send_email(self, service, to_addr, subject, text_body, html_body=None, from_name=None, thread_id=None)
+    def mark_as_read(self, service, msg_id)
 class BiggerBrotherEmailSystem:
     def __init__(self, base_dir=None, use_config=True)
     def start(self)
@@ -433,6 +437,57 @@ class GraphStore:
     def get_neighbors(self, node_id: str, edge_kind: str=None, direction: str='both') -> List[dict]
 ```
 
+**`assistant\home\day_planner.py`**
+📥 Reads: `<os.path.join()>`
+📁 Uses: `<PLAN_DIR>, <grocery_items>, data/`
+Imports: `__future__.annotations, dataclasses.asdict, dataclasses.dataclass`
+```python
+class Block:
+class DayPlanner:
+    def __init__(self, start_hour=9, end_hour=22)
+    def plan(self, today_tasks: List[Dict], grocery_items: List[str], meal_blocks: List[Dict]) -> Dict
+```
+
+**`assistant\home\nl_note_listener.py`**
+📁 Uses: `<constraints>`
+Imports: `__future__.annotations, dataclasses.dataclass`
+```python
+class Intent:
+```
+
+**`assistant\home\nutrition_tracker.py`**
+📥 Reads: `<p>, <self._path_for()>`
+📤 Writes: `<day>`
+📁 Uses: `data/`
+Imports: `__future__.annotations, dataclasses.asdict, dataclasses.dataclass`
+```python
+class NutritionTotals:
+    def add(self, other: 'NutritionTotals')
+class NutritionTracker:
+    def __init__(self, db: Optional[Dict[Tuple]]=None, log_dir: str=NUTRITION_LOG_DIR)
+    def ensure_food(self, name: str, per100g: Dict)
+    def compute(self, name: str, qty: float, unit: str, per_unit_grams: float=0.0) -> NutritionTotals
+    def log_meal(self, label: str, ingredients: List[Tuple[Tuple]]) -> Dict
+    def aggregate(self, entries: List[Dict]) -> Dict
+```
+
+**`assistant\home\pantry_manager.py`**
+📥 Reads: `<dynamic>`
+📤 Writes: `<dynamic>`
+📁 Uses: `data/`
+Imports: `__future__.annotations, dataclasses.asdict, dataclasses.dataclass, math`
+```python
+class PantryItem:
+class PantryManager:
+    def __init__(self, path: str=PANTRY_PATH)
+    def add(self, name: str, qty: float, unit: str, **kwargs)
+    def set_threshold(self, name: str, min_qty: float)
+    def use(self, name: str, qty: float)
+    def consume_bulk(self, ingredients: List[Tuple[Tuple]]) -> List[str]
+    def low_items(self) -> List[PantryItem]
+    def snapshot(self) -> Dict[Tuple]
+```
+
 **`assistant\importers\enhanced_smart_label_importer.py`**
 _Enhanced Smart Label Importer with Two-Tier Harmonization_
 📥 Reads: `<chunk_file>, <dynamic>`
@@ -444,6 +499,7 @@ class EnhancedLabelHarmonizer:
     def __init__(self, harmonization_report_path: str='data/harmonization_report.json', target_groups: Dict[Tuple]=None, similarity_threshold: float=0.8, min_semantic_distance: float=0.5, use_real_embeddings: bool=True, embedding_cache_file: str='data/embedding_cache.pkl')
     def enable_batch_mode(self)
     def disable_batch_mode(self)
+    def get_embedding(self, text: str)
     def compute_string_similarity(self, label1: str, label2: str) -> float
     def compute_similarity(self, label1: str, label2: str, use_embeddings: bool=True) -> float
     def find_canonical(self, label: str, category: str) -> Tuple[Tuple]
@@ -567,10 +623,10 @@ class CodebaseAnalyzer:
 
 **Processing Modules** (transformation):
 - `assistant.conversational_logger`
+- `assistant.behavioral_engine.enhanced_gmail_runner`
 - `assistant.behavioral_engine.context.similarity_matcher`
 - `assistant.behavioral_engine.features.enhanced_feature_extraction`
 - `assistant.behavioral_engine.gamification.rpg_system`
-- `assistant.behavioral_engine.logbooks.dynamic_logbook_system`
 
 ## Key Dependencies
 
