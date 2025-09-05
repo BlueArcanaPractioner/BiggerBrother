@@ -48,6 +48,7 @@ from assistant.behavioral_engine.logbooks.dynamic_logbook_system import (
     DetailedActivityLogger,
     LogBookAssistant
 )
+from assistant.behavioral_engine.intents.intent_dispatcher import handle_incoming_text
 
 dotenv.load_dotenv()
 
