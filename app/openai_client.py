@@ -4,6 +4,7 @@ from __future__ import annotations
 import os, json, typing as t
 import sys
 from datetime import datetime, timezone, time
+import hashlib
 
 from dotenv import load_dotenv
 
@@ -61,10 +62,10 @@ def _safe(obj):
 
 def _dbg(label: str, payload):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
-    if isinstance(payload, (dict, list)):
-        print(f"[API-DEBUG {ts}] {label}:\n{_safe(payload)}", file=sys.stderr, flush=True)
-    else:
-        print(f"[API-DEBUG {ts}] {label}: {payload}", file=sys.stderr, flush=True)
+    #if isinstance(payload, (dict, list)):
+        #print(f"[API-DEBUG {ts}] {label}:\n{_safe(payload)}", file=sys.stderr, flush=True)
+    #else:
+        #print(f"[API-DEBUG {ts}] {label}: {payload}", file=sys.stderr, flush=True)
 
 class OpenAIClient:
     """
@@ -180,6 +181,63 @@ class OpenAIClient:
             return resp["choices"][0]["text"]
         except Exception as e:
             return f"[ERROR COMPLETION: {e}]"
+
+    # --- Embeddings (new) ---------------------------------------------------
+    def embed(self, inputs: t.Union[str, list[str]], model: str | None = None, dim: int = 1536) -> list[list[float]]:
+        """
+        Return embeddings for one or many strings.
+        - Uses OpenAI v1 client if available, else old module, else deterministic offline stub.
+        - Always returns List[List[float]] (even for a single input).
+        """
+        model = model or os.getenv("OPENAI_EMBED_MODEL") or "text-embedding-3-large"
+        texts: list[str] = [inputs] if isinstance(inputs, str) else list(inputs)
+
+        _dbg("REQUEST.embed", {
+            "model": model,
+            "count": len(texts),
+            "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        })
+
+        reason = _offline_reason(self)
+        if reason:
+            _dbg("OFFLINE", reason)
+            return [self._offline_embed(t, dim=dim) for t in texts]
+
+        try:
+            # Prefer modern client if present
+            if self._new and hasattr(self.client, "embeddings"):
+                resp = self.client.embeddings.create(model=model, input=texts)
+                vecs = [d.embedding for d in resp.data]
+            else:
+                # Old 0.x style
+                resp = self._sdk.Embedding.create(model=model, input=texts)  # type: ignore[attr-defined]
+                vecs = [d["embedding"] for d in resp["data"]]
+            _dbg("RESPONSE.embed", {"count": len(vecs)})
+            return vecs
+        except Exception as e:
+            _dbg("ERROR.embed", {"type": type(e).__name__, "message": str(e)})
+            if self.raise_on_fail:
+                raise
+            # graceful fallback
+            return [self._offline_embed(t, dim=dim) for t in texts]
+
+    def _offline_embed(self, text: str, *, dim: int = 1536) -> list[float]:
+        """
+        Deterministic, normalized vector for offline/testing paths.
+        """
+        seed = int.from_bytes(hashlib.sha1((text or "").encode("utf-8")).digest()[:8], "big")
+        # simple Weyl sequence  mod to fake Gaussian-ish spread
+        x, a, m = seed % 2147483647 or 1, 1103515245, 2**31 - 1
+        vals = []
+        ssum = 0.0
+        for _ in range(dim):
+            x = (a * x + 12345) % m
+            # scale to [-1,1]
+            v = ((x / m) * 2.0) - 1.0
+            vals.append(v)
+            ssum = v * v
+        n = (ssum ** 0.5) or 1.0
+        return [v / n for v in vals]
 
 def _looks_like_chat_model(model: str) -> bool:
     m = model.lower()

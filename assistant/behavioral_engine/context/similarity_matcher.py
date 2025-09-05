@@ -9,9 +9,13 @@ tier weights, and recency bias to build optimal context headers.
 from __future__ import annotations
 import json
 import os
+import sys
 import math
 import time
 import hashlib
+import platform
+import threading
+import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
@@ -19,11 +23,80 @@ from collections import defaultdict
 import numpy as np
 import re
 import tempfile, pickle
+import tracemalloc
+import faulthandler
+from types import SimpleNamespace
+from functools import lru_cache
+
+from numpy import save
 
 from app.openai_client import OpenAIClient
 from app.label_integration_wrappers import LabelGenerator
 from assistant.importers.enhanced_smart_label_importer import EnhancedLabelHarmonizer
 
+LOGGER_NAME = "matcher"
+
+def _ts():
+    return datetime.now(timezone.utc).isoformat()
+
+def _log(msg: str):
+    print(f"[{LOGGER_NAME}][{_ts()}] {msg}")
+
+
+# --- robust label normalization ---------------------------------------------
+def _as_label_list(val: Any) -> List[str]:
+    """
+    Convert various shapes into a clean list[str] of *labels*.
+    - Strings -> [string]
+    - (list|tuple|set) of strings -> list[str]
+    - NumPy arrays:
+        * object/str dtype -> tolist()  str()
+        * numeric dtype (e.g., embeddings) -> ignored (return [])
+    - dict: if it looks like {'labels': [...]}, use that; else ignore ([])
+    - None/other -> []
+    """
+    if val is None:
+        return []
+    if isinstance(val, str):
+        return [val]
+    if isinstance(val, (list, tuple, set)):
+        return [str(x) for x in val if isinstance(x, str)]
+    if isinstance(val, dict):
+        lab = val.get("labels")
+        if isinstance(lab, (list, tuple, set, np.ndarray)):
+            return _as_label_list(lab)
+        return []
+    try:
+        if isinstance(val, np.ndarray):
+            # treat only string/object arrays as label-y; ignore numeric arrays (e.g., embeddings)
+            if val.dtype.kind in ("U", "S", "O"):
+                return [str(x) for x in val.tolist()]
+            return []
+    except Exception:
+        pass
+    return []
+
+# --- perf flags (all optional, toggle via env vars) ---
+_PROFILE      = os.getenv("BB_MATCHER_PROFILE", "0") == "1"
+_LOG_EVERY    = int(os.getenv("BB_MATCHER_LOG_EVERY", "500"))   # loop progress cadence
+_STALL_SECS   = int(os.getenv("BB_MATCHER_STALL_SECS", "120"))  # dump tracebacks if no log in this long
+_MEM_SAMPLING = os.getenv("BB_MATCHER_MEM", "0") == "1"
+_IO_WARN_SECS = float(os.getenv("BB_MATCHER_TO_WARN_SECS", "2.0"))
+# Hard watchdog (faulthandler) is disabled on Windows to avoid access violations on 3.13
+_USE_HARD_FAULT = (_PROFILE and platform.system() != "Windows")
+
+class PhaseTimer:
+    def __init__(self, name: str, sink: Dict[str, float]):
+        self.name = name
+        self.sink = sink
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        if _PROFILE: _log(f"BEGIN {self.name}")
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        dt = time.perf_counter() - self.t0
+        self.sink[self.name] = self.sink.get(self.name, 0.0) + dt
+        if _PROFILE: _log(f"END   {self.name} in {dt:.3f}s")
 
 
 class ContextSimilarityMatcher:
@@ -65,6 +138,14 @@ class ContextSimilarityMatcher:
             recency_decay_factor: Exponential decay per day for recency
             recency_cutoff_days: Max days to look back for context
         """
+        self._perf = {}
+        self._metrics = SimpleNamespace(sim_calls = 0, sim_time=0.0, io_calls = 0, io_time=0.0)
+        self._soft_wd = None #soft watchdog handle
+
+        #chunk index/cache
+        self._chunk_index: Optional[Dict[str, Path]] = None
+        self._chunk_cache: Dict[str, Dict] = {}
+
         self.labels_dir = Path(labels_dir)
         self.chunks_dir = Path(chunks_dir)
         self.harmonization_dir = Path(harmonization_dir)
@@ -73,9 +154,12 @@ class ContextSimilarityMatcher:
         self.label_generator = LabelGenerator(self.openai_client)
         self.harmonizer = harmonizer
 
-        # Embedding cache file: unify with harmonizer if available
+        # Embedding cache file: reuse harmonizer's if available, else local default
         if self.harmonizer and hasattr(self.harmonizer, "embedding_cache_file"):
+            self.embedding_cache_file = Path(self.harmonizer.embedding_cache_file)
+        else:
             self.embedding_cache_file = self.harmonization_dir / 'embedding_cache.pkl'
+
         
         # Context parameters
         self.context_minimum_char_long_term = context_minimum_char_long_term
@@ -111,6 +195,26 @@ class ContextSimilarityMatcher:
         self.gen_thr_str = float(os.getenv("BB_THR_GENERAL_STR", "0.35"))
         self.spec_thr_str = float(os.getenv("BB_THR_SPECIFIC_STR", "0.6"))
 
+        # Embedding blend / rerank controls
+        self.use_embedding_blend = os.getenv("BB_EMBED_BLEND", "1") == "1"
+        self.embed_blend_weight = float(os.getenv("BB_EMBED_WEIGHT", "0.6"))
+        self.embed_rerank_topk = int(os.getenv("BB_EMBED_RERANK_TOPK", "300"))
+        # Never hit network during rerank unless explicitly allowed
+        self.embed_rerank_allow_api = os.getenv("BB_EMBED_RERANK_API", "0") == "1"
+        # Embedding model + dimension (must be consistent everywhere)
+        self.embed_model = os.getenv("BB_EMBED_MODEL", os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
+        _dim_map = {"text-embedding-3-small": 1536, "text-embedding-3-large": 3072}
+        self.embed_dim = int(os.getenv("BB_EMBED_DIM", str(_dim_map.get(self.embed_model, 1536))))
+        # New: never blend embeddings during the main scan unless explicitly enabled
+        self.embed_in_scan = os.getenv("BB_EMBED_IN_SCAN", "0") == "1"
+        # New: control how often we write the embedding cache to disk
+        #   immediate | throttle | off
+        self.embed_cache_save_mode = os.getenv("BB_EMBED_CACHE_SAVE", "throttle")
+        self.embed_cache_save_every = int(os.getenv("BB_EMBED_CACHE_SAVE_EVERY", "200"))
+        self.embed_cache_save_secs = float(os.getenv("BB_EMBED_CACHE_SAVE_SECS", "5.0"))
+        self._embed_cache_dirty = 0
+        self._embed_cache_last_save = time.time()
+
         def _dbg(msg: str):
             if self.debug_verbose:
                 print(f"[matcher][{datetime.now(timezone.utc).isoformat()}] {msg}")
@@ -134,7 +238,57 @@ class ContextSimilarityMatcher:
                 self._dbg(f"loaded {len(self.synonyms)} synonyms")
             except Exception as e:
                 self._dbg(f"failed to load synonyms: {e}")
-    
+        # Optional: debug sampling of canonical keys
+        self.debug_list_keys = int(os.getenv("BB_DEBUG_LIST_KEYS", "0"))
+        self.debug_find_contains = os.getenv("BB_DEBUG_FIND_CONTAINS", "").lower().strip()
+
+    # ----------------- soft watchdog (safe on Windows) -----------------
+    def _start_soft_watchdog(self, stall_secs: int):
+        state = SimpleNamespace(last=time.perf_counter(), stop=False, secs=stall_secs)
+        def loop():
+            while not state.stop:
+                time.sleep(stall_secs)
+                nowt = time.perf_counter()
+                if nowt - state.last >= stall_secs:
+                    _log(f"SOFT TIMEOUT ({stall_secs}s)! Dumping stacks …")
+                    for tid, frame in sys._current_frames().items():
+                        print(f"\n--- Thread {tid} stack ---")
+                        traceback.print_stack(frame)
+                    print("--- end stacks ---\n")
+        th = threading.Thread(target=loop, daemon=True)
+        th.start()
+        self._soft_wd = SimpleNamespace(state=state, thread=th)
+
+    # ----------------- fast chunk lookup -----------------
+    def _ensure_chunk_index(self):
+        """Build an in-memory gid -> chunk_path index once."""
+        if self._chunk_index is not None:
+            return
+        idx: Dict[str, Path] = {}
+        t0 = time.perf_counter()
+        for chunk_file in self.chunks_dir.glob("*.json"):
+            try:
+                # read minimal to get gid; utf-8-sig handles BOM if present
+                with open(chunk_file, "r", encoding="utf-8-sig") as f:
+                    obj = json.load(f)
+                gid = obj.get("gid")
+                if gid:
+                    idx[gid] = chunk_file
+            except Exception:
+                continue
+        self._chunk_index = idx
+        if _PROFILE:
+            _log(f"built chunk index: {len(idx)} files in {time.perf_counter()-t0:.2f}s")
+
+    def _soft_watchdog_heartbeat(self):
+        if self._soft_wd is not None:
+            self._soft_wd.state.last = time.perf_counter()
+
+    def _stop_soft_watchdog(self):
+        if self._soft_wd is not None:
+            self._soft_wd.state.stop = True
+            self._soft_wd = None
+
     def _load_harmonization_tier(self, tier: str) -> Dict:
         """Load a harmonization tier file."""
         file_path = self.harmonization_dir / f"harmonization_{tier}.json"
@@ -186,12 +340,37 @@ class ContextSimilarityMatcher:
             with os.fdopen(fd, "wb") as f:
                 pickle.dump(self.embedding_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
                 f.flush()
-                os.fsync(f.fileno())
+                if os.getenv("BB_EMBED_CACHE_FSYNC", "0") == "1":
+                    os.fsync(f.fileno())
             os.replace(tmp_path, cache_file)  # atomic on same filesystem
         finally:
             try:
                 os.remove(tmp_path)
             except FileNotFoundError:
+                pass
+
+    def _ensure_embeddings_for(self, labels: List[str], save_every: int = 1, allow_api: bool = True) -> None:
+        """
+        Ensure embeddings exist for each label in the persistent cache.
+        """
+        added = 0
+        for i, lab in enumerate(labels, 1):
+            if lab in self.embedding_cache:
+                continue
+            v = self._get_embedding(lab, allow_api=allow_api, save=False)
+            if v is not None:
+                added += 1
+                if added % save_every == 0:
+                    try:
+                        self._save_embedding_cache()
+                    except Exception:
+                        pass
+        if added and self.embed_cache_save_mode != "off":
+            try:
+                self._save_embedding_cache()
+                self._embed_cache_dirty = 0
+                self._embed_cache_last_save = time.time()
+            except Exception:
                 pass
     
     def get_message_labels(self, message: str) -> Dict:
@@ -359,6 +538,21 @@ class ContextSimilarityMatcher:
         if syn_target and syn_target in category_groups:
             self._dbg(f"_find_best_group: synonym shortcut '{label}' -> '{syn_target}'")
             return syn_target
+        # nearest-canonical fallback if the synonym target doesn't exist as a key
+        if syn_target:
+            tgt_norm = self._normalize_label(syn_target)
+            best_canon = None; best_sim = 0.0
+            T = self._tokens(tgt_norm)
+            if T:
+                for canon in category_groups.keys():
+                    sim = self._token_jaccard(T, self._tokens(self._normalize_label(canon)))
+                    if sim > best_sim:
+                        best_sim, best_canon = sim, canon
+                # accept if it's reasonably close (half of threshold is fine for a “hint”)
+                min_accept = (self.gen_thr_str if self.debug_string_only else self.gen_thr) * 0.5
+                if best_canon and best_sim >= min_accept:
+                    self._dbg(f"_find_best_group: synonym fallback '{label}' -> '{best_canon}' (via '{syn_target}', sim={best_sim:.3f})")
+                    return best_canon
 
 
         # Get embedding for the label (unless in string-only debug mode)
@@ -375,6 +569,12 @@ class ContextSimilarityMatcher:
             key=lambda x: len(x[1]),
             reverse=True
         )
+
+        if self.debug_list_keys:
+            keys = [k for k,_ in sorted_groups[:self.debug_list_keys]]
+            if self.debug_find_contains:
+                keys = [k for k in keys if self.debug_find_contains in k.lower()]
+            self._dbg(f"sample canonical keys ({len(keys)}): {keys}")
         
         best_similarity = 0
         best_group = None
@@ -444,78 +644,124 @@ class ContextSimilarityMatcher:
         inter = len(A & B)
         union = len(A | B) or 1
         return inter / union
-        
-    def _get_embedding(self, text: str) -> Optional[np.ndarray]:
-        """
-        Return embedding for 'test', populating and PERSISTING the cache on miss.
-        """
 
+    def _get_embedding(self, text: str, allow_api: bool = True, *, save: bool = True) -> Optional[np.ndarray]:
+        """
+        Unified embedding access with persistent cache:
+        1) cache → 2) (optional) harmonizer/OpenAI → 3) simulated fallback.
+        If allow_api=False, we will NOT call out to harmonizer/OpenAI.
+        """
         vec = self.embedding_cache.get(text)
         if vec is not None:
-            return vec
-        vec = self.harmonizer.get_embedding(text)
+            v = self._fit_dim(np.asarray(vec, dtype=np.float32))
+            # upgrade cached vector shape if needed
+            if (isinstance(vec, (list, tuple)) and len(vec) != self.embed_dim) or (
+                    isinstance(vec, np.ndarray) and vec.shape[0] != self.embed_dim
+            ):
+                self.embedding_cache[text] = v
+                if save and self.embed_cache_save_mode != "off":
+                    self._embed_cache_dirty = 1
+            return v
+        if allow_api:
+            # Prefer harmonizer if wired
+            try:
+                if self.harmonizer is not None and hasattr(self.harmonizer, "get_embedding"):
+                    vec = self.harmonizer.get_embedding(text)
+            except Exception:
+                vec = None
+            # Direct OpenAI fallback (no call when string-only debug)
+            if vec is None and self.openai_client is not None and not self.debug_string_only:
+                try:
+                    # unified client wrapper
+                    vecs = self.openai_client.embed(text, model=self.embed_model, dim=self.embed_dim)
+                    vec = np.asarray(vecs[0], dtype=np.float32)
+                except Exception as e:
+                    print(f"[warn] embeddings API failed for '{text[:40]}': {e}")
+                    vec = None
+        # Simulated final fallback (keeps cosine math defined)
+        if vec is None and not self.debug_string_only:
+            vec = self._simulated_embedding(text)
         if vec is None:
             return None
+        vec = self._fit_dim(np.asarray(vec, dtype=np.float32))
         self.embedding_cache[text] = vec
-
-        try:
-            self._save_embedding_cache()
-        except Exception as e:
-            if hasattr(self, "logger"):
-                self.logger.warning(f"embedding cache save failed: {e}")
-            else:
-                print(f"[warn] embedding cache save failed: {e}")
+        # Defer or skip disk saves in hot loops
+        if save and self.embed_cache_save_mode != "off":
+            self._embed_cache_dirty = 1
+            now = time.time()
+            if (
+                    self.embed_cache_save_mode == "immediate"
+                    or self._embed_cache_dirty >= self.embed_cache_save_every
+                    or (now - self._embed_cache_last_save) >= self.embed_cache_save_secs
+            ):
+                try:
+                    self._save_embedding_cache()
+                    self._embed_cache_dirty = 0
+                    self._embed_cache_last_save = now
+                except Exception as e:
+                    print(f"[warn] embedding cache save failed: {e}")
         return vec
     
     
     def _simulated_embedding(self, text: str) -> np.ndarray:
-    
         """Create a simulated embedding based on text features."""
-    
         import hashlib
-    
-        features = []
-    
-        
-    
+        dim = int(getattr(self, "embed_dim", 1536))  # use configured dim if present
+
+        features: list[float] = []
         # Length features
-    
-        features.append(len(text) / 100)
-    
-        features.append(len(text.split()) / 20)
-    
-        
-    
+        features.append(len(text) / 100.0)
+        features.append(len(text.split()) / 20.0)
         # Character distribution
-    
-        for char in 'aeiou':
-    
-            features.append(text.count(char) / max(len(text), 1))
-    
-        
-    
-        # Hash-based pseudo-random features
-    
-        text_hash = hashlib.md5(text.encode()).digest()
-    
-        for i in range(10):
-    
-            features.append(text_hash[i] / 255)
-    
-        
-    
-        # Pad to standard embedding size (1536 for OpenAI)
-    
-        while len(features) < 1536:
-    
-            features.append(0)
-    
-        
-    
-        return np.array(features[:1536])
+        L = max(len(text), 1)
+        for char in "aeiou":
+            features.append(text.count(char) / L)
+        # Hash-based pseudo-random features (low-cost, deterministic)
+        md = hashlib.md5(text.encode("utf-8")).digest()
+        for i in range(min(32, len(md))):
+            features.append(md[i] / 255.0)
+        # Deterministic PRNG tail to reach target dim
+        if len(features) < dim:
+            seed = int.from_bytes(hashlib.sha1(text.encode("utf-8")).digest()[:8], "big")
+            x = seed % 2147483647 or 1
+            a, m = 1103515245, 2**31 - 1
+            while len(features) < dim:
+                x = (a * x + 12345) % m
+                # scale to [-1, 1]
+                features.append(((x / m) * 2.0) - 1.0)
+        v = np.asarray(features[:dim], dtype=np.float32)
+        # L2 normalize so cosine works predictably
+        n = float(np.linalg.norm(v)) or 1.0
+        return (v / n).astype(np.float32)
+
     def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
         """Calculate cosine similarity between two vectors."""
         return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+    # --- embedding dimension alignment --------------------------------------
+    def _fit_dim(self, vec: np.ndarray) -> np.ndarray:
+        """
+        Ensure vector is exactly self.embed_dim long.
+        - If longer: downsample by mean pooling if divisible, else truncate.
+        - If shorter: pad with zeros.
+        Returns float32 array.
+        """
+        v = np.asarray(vec, dtype=np.float32)
+        n = v.shape[0]
+        d = self.embed_dim
+        if n == d:
+            return v
+        if n > d:
+            # mean-pool if cleanly divisible; otherwise truncate
+            if n % d == 0:
+                r = n // d
+                v = v.reshape(d, r).mean(axis=1)
+                return v.astype(np.float32, copy=False)
+            return v[:d].astype(np.float32, copy=False)
+        # n < d → pad zeros
+        out = np.zeros(d, dtype=np.float32)
+        out[:n] = v
+        return out
     
     def _add_to_group(self, label: str, group: str, category: str, tier: str):
         """Add a new label to a harmonization group."""
@@ -638,31 +884,72 @@ class ContextSimilarityMatcher:
         self._canon_map = canon_map
 
     def _canonicalize_label_list(self, raw_list, category: str, tier: str = "specific") -> dict[str, float]:
+        """
+        Robustly canonicalize a possibly-messy label list into {canonical_label: weight}.
+        Accepts:
+          - [{'label': 'foo', 'p': 0.9}], [{'text': 'foo'}], ['foo', 'bar'], ('foo', 0.7)
+          - numpy arrays of strings/objects
+        Ignores numeric arrays and empty/None entries.
+        """
         out: dict[str, float] = {}
         cmap = self._canon_map.get(category, {})
 
-        for item in (raw_list or []):
-            raw = item.get("label") or item.get("text") or ""
+        # Normalize raw_list into a list of "items" we can read from
+        if raw_list is None:
+            items = []
+        elif isinstance(raw_list, dict):
+            # e.g. {'labels': [...]}
+            items = raw_list.get("labels") or []
+        elif isinstance(raw_list, (list, tuple, set)):
+            items = list(raw_list)
+        elif isinstance(raw_list, np.ndarray):
+            # only treat string/object arrays as label-y
+            items = raw_list.tolist() if raw_list.dtype.kind in ("U", "S", "O") else []
+        else:
+            items = [raw_list]
+
+        for it in items:
+            # Coerce each element into a dict-like {label: str, p: float}
+            if isinstance(it, str):
+                item = {"label": it, "p": 1.0}
+            elif isinstance(it, dict):
+                item = it
+            elif isinstance(it, (list, tuple)) and len(it) >= 1:
+                # supports ('foo', 0.8)
+                item = {"label": str(it[0]), "p": float(it[1]) if len(it) > 1 else 1.0}
+            else:
+                continue
+
+            raw = (item.get("label") or item.get("text") or "").strip()
             if not raw:
                 continue
-            p = float(item.get("p", item.get("probability", 1.0)))
-            p = 0.0 if p < 0 else (1.0 if p > 1.0 else p)
 
+            # probability weight with clamping to [0,1]
+            try:
+                p_val = item.get("p", item.get("probability", 1.0))
+                p = float(p_val)
+            except Exception:
+                p = 1.0
+            if p < 0.0:
+                p = 0.0
+            elif p > 1.0:
+                p = 1.0
+
+            # Your existing canonicalization logic (kept intact)
             if raw in cmap:
                 spec, gen = cmap[raw]
             else:
-                # reuse your helper(s), no new logic
                 gen = self._find_best_group(raw, category, "general")
                 spec = self._find_best_specific_within(raw, category, gen) if gen else None
-                # fallbacks that keep us moving
                 if spec is None and gen is not None:
                     spec = raw  # unknown specific under known general
                 if gen is None:
-                    gen = spec or raw  # keep it self-contained
+                    gen = spec or raw  # self-contained fallback
 
             key = spec if tier == "specific" else gen
             if key:
-                out[key] = max(out.get(key, 0.0), p)
+                prev = out.get(key)
+                out[key] = max(prev, p) if prev is not None else p
 
         return out
 
@@ -677,6 +964,68 @@ class ContextSimilarityMatcher:
         inter = sum(min(a.get(k, 0.0), b.get(k, 0.0)) for k in keys)
         union = sum(max(a.get(k, 0.0), b.get(k, 0.0)) for k in keys)
         return inter / union if union > 0 else 0.0
+
+
+    def _cat_vec(self, canon_map: Dict[str, float], *, allow_api: bool = False) -> Optional[np.ndarray]:
+        """
+        Weighted, L2-normalized category vector for a canonical label map.
+        Cache-only by default (allow_api=False) so scans never hit network.
+        """
+        if not canon_map:
+            return None
+        vecs: list[np.ndarray] = []
+        weights: list[float] = []
+        for label, w in canon_map.items():
+            v = self._get_embedding(label, allow_api=allow_api, save=False)
+            if v is None:
+                continue
+            vecs.append(np.asarray(v, dtype=np.float32))
+            weights.append(float(w))
+        if not vecs:
+            return None
+        V = np.vstack(vecs)                         # [m, d]
+        W = np.asarray(weights, dtype=np.float32)[:, None]  # [m, 1]
+        cat = (V * W).sum(axis=0)                   # [d]
+        n = float(np.linalg.norm(cat))
+        if n == 0.0:
+            return None
+        return (cat / n).astype(np.float32)
+
+    def _score_labels(
+        self,
+        cur: Dict[str, Dict[str, float]],
+        tgt: Dict[str, Dict[str, float]],
+        *,
+        w_topic: float = 0.91,
+        w_tone: float = 0.03,
+        w_intent: float = 0.06,
+        embed_weight: float = 0.0,
+        cur_vecs: Optional[tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]] = None,
+        allow_api_for_tgt_vecs: bool = False,
+    ) -> float:
+        """
+        Fast, composable similarity between current and target label maps.
+        1) Weighted-Jaccard on canonical labels
+        2) Optional cached-embedding cosine blend
+        Returns a scalar in [0, 1] (not hard-clamped; depends on your weights).
+        """
+        # label overlap
+        s_topic  = self._weighted_jaccard(cur.get("topic", {}),  tgt.get("topic", {}))
+        s_tone   = self._weighted_jaccard(cur.get("tone", {}),   tgt.get("tone", {}))
+        s_intent = self._weighted_jaccard(cur.get("intent", {}), tgt.get("intent", {}))
+        sim = w_topic * s_topic + w_tone * s_tone + w_intent * s_intent
+
+        # embedding blend (cache-only unless you flip allow_api_for_tgt_vecs=True)
+        if embed_weight > 0.0 and cur_vecs is not None:
+            cv_topic, cv_tone, cv_intent = cur_vecs
+            tv_topic  = self._cat_vec(tgt.get("topic",  {}), allow_api=allow_api_for_tgt_vecs)
+            tv_tone   = self._cat_vec(tgt.get("tone",   {}), allow_api=allow_api_for_tgt_vecs)
+            tv_intent = self._cat_vec(tgt.get("intent", {}), allow_api=allow_api_for_tgt_vecs)
+            cos_score = (w_topic * self._cos(cv_topic,  tv_topic) +
+                        w_tone  * self._cos(cv_tone,   tv_tone) +
+                        w_intent* self._cos(cv_intent, tv_intent))
+            sim = (1.0 - embed_weight) * sim + embed_weight * cos_score
+        return float(sim)
 
     def _coerce_ts(self, label_path, label_obj, now_utc: datetime) -> datetime:
         """
@@ -747,16 +1096,29 @@ class ContextSimilarityMatcher:
         min_chars_recent = min_chars_recent or self.context_minimum_char_recent
         min_chars_long_term = min_chars_long_term or self.context_minimum_char_long_term
 
-        # Setup
-        t0 = time.time()
-        self._dbg("begin finding similar messages")
-        self._load_two_tier_maps()
-        self._dbg(f"loaded two-tier maps in {time.time() - t0:.3f}s")
+        # setup optional stall watchdog & memory sampling
+        def heartbeat(msg: str = ""):
+            if _PROFILE:
+                self._soft_watchdog_heartbeat()
+        if _PROFILE:
+            if _USE_HARD_FAULT:
+                faulthandler.enable()
+                faulthandler.dump_traceback_later(_STALL_SECS, repeat=False)
+            else:
+                self._start_soft_watchdog(_STALL_SECS)
+            if _MEM_SAMPLING and not tracemalloc.is_tracing():
+                tracemalloc.start(25)
+
+        # 0) ensure harmonization maps are loaded
+        with PhaseTimer("load_two_tier_maps", self._perf):
+            self._load_two_tier_maps()
         now = datetime.now(timezone.utc)
+
 
         # Current labels → canonical (specific)
         t1 = time.time()
-        current_labels = self.get_message_labels(message)
+        with PhaseTimer("label)current", self._perf):
+            current_labels = self.get_message_labels(message)
         # Robust summary for debug: count only containers; show scalars as-is
         if self.debug_verbose:
             summary = {}
@@ -767,10 +1129,10 @@ class ContextSimilarityMatcher:
                     summary[k] = v
             self._dbg(f"get_message_labels -> {summary} in {time.time() - t1:.3f}s")
         ct0=time.time()
-        cur_topics = self._canonicalize_label_list(current_labels.get("topic", []), "topic", tier="specific")
-        cur_tones = self._canonicalize_label_list(current_labels.get("tone", []), "tone", tier="specific")
-        cur_intents = self._canonicalize_label_list(current_labels.get("intent", []), "intent", tier="specific")
-        self._dbg(f"canonicalized: topics={len(cur_topics)}, tones={len(cur_tones)}, intents={len(cur_intents)} in {time.time()-t0:.3f}s")
+        with PhaseTimer("canonicalize_current", self._perf):
+            cur_topics = self._canonicalize_label_list(current_labels.get("topic", []), "topic", tier="specific")
+            cur_tones = self._canonicalize_label_list(current_labels.get("tone", []), "tone", tier="specific")
+            cur_intents = self._canonicalize_label_list(current_labels.get("intent", []), "intent", tier="specific")
 
         # Create files for current message
         chunk_file, label_file = self._create_message_files(message, current_labels)
@@ -787,149 +1149,219 @@ class ContextSimilarityMatcher:
         cur_gen_intent = set(
             self._canonicalize_label_list(current_labels.get("intent", []), "intent", tier="general").keys())
 
-        # Optional cosine blend from cached embeddings (no API)
-        use_embed_blend = getattr(self, "use_embedding_blend", False) and hasattr(self, "embedding_cache")
-        embed_weight = float(getattr(self, "embed_blend_weight", 0.6))
-        embed_weight = 0.0 if not use_embed_blend else max(0.0, min(1.0, embed_weight))
-
-        def _cat_vec(canon: Dict[str, float]) -> Optional[List[float]]:
-            if not use_embed_blend:
-                return None
-            acc = None
-            for lab, w in canon.items():
-                v = self.embedding_cache.get(lab)
-                if v is None:
-                    continue
-                acc = [w * x for x in v] if acc is None else [a + w * x for a, x in zip(acc, v)]
-            if acc is None:
-                return None
-            import math
-            n = math.sqrt(sum(a * a for a in acc)) or 0.0
-            return [a / n for a in acc] if n > 0 else None
-
-        def _cos(u: Optional[List[float]], v: Optional[List[float]]) -> float:
-            if u is None or v is None:
-                return 0.0
-            return float(sum(a * b for a, b in zip(u, v)))
+        # IMPORTANT: no embedding blend during the main scan by default
+        use_embed_blend = bool(getattr(self, "use_embedding_blend", True)) and hasattr(self, "embedding_cache")
+        _env_weight = float(getattr(self, "embed_blend_weight", 0.6))
+        embed_weight = (_env_weight if (use_embed_blend and self.embed_in_scan) else 0.0)
 
         # Precompute current vectors once (only if blending)
-        _cur_v_topic = _cat_vec(cur_topics)
-        _cur_v_tone = _cat_vec(cur_tones)
-        _cur_v_intent = _cat_vec(cur_intents)
+        _cur_v_topic = self._cat_vec(cur_topics, allow_api=False)
+        _cur_v_tone = self._cat_vec(cur_tones, allow_api=False)
+        _cur_v_intent = self._cat_vec(cur_intents, allow_api=False)
+        _cur_vecs = (_cur_v_topic, _cur_v_tone, _cur_v_intent)
 
-        self._dbg("begin candidate scan")
+        # ---------- Candidate scan over label files ----------
         similarities: List[Dict] = []
-        for label_file_path in self.labels_dir.glob("*.json"):
-            try:
-                with open(label_file_path, "r", encoding="utf-8") as f:
-                    target_labels = json.load(f)
-                gid = target_labels.get("gid")
-                if not gid:
-                    continue
-                if _new_gid and gid == _new_gid:
-                    continue
+        label_files = list(self.labels_dir.glob("*.json"))  # list once so we can show progress
+        n_labels = len(label_files)
+        self._dbg(f"begin candidate scan (files={n_labels})")
 
-                # Timestamp: try filename, then label fields, then file mtime, else ~7d ago
-                ts_str = label_file_path.stem.split("_")[0]
+        with PhaseTimer("scan_candidate_labels", self._perf):
+            block_t0 = time.perf_counter()
+            for i, label_file_path in enumerate(label_files, 1):
+                # Progress heartbeat every N files
+                if _PROFILE and (i % _LOG_EVERY == 0 or i == n_labels):
+                    dt = time.perf_counter() - block_t0
+                    _log(f"scan {i}/{n_labels} (~{100 * i // max(1, n_labels)}%) sims={len(similarities)} in {dt:.2f}s")
+                    heartbeat(f"scan i={i}")
+
                 try:
-                    ts = datetime.strptime(ts_str, "%Y%m%d").replace(tzinfo=timezone.utc)
-                except Exception:
-                    ts = target_labels.get("timestamp")
-                    if isinstance(ts, str):
-                        try:
-                            ts = datetime.fromisoformat(ts)
-                        except Exception:
-                            ts = None
-                    if not isinstance(ts, datetime):
-                        ts = self._coerce_ts(label_file_path, target_labels, now)
+                    with open(label_file_path, "r", encoding="utf-8") as f:
+                        target_labels = json.load(f)
+                    gid = target_labels.get("gid")
+                    if not gid: continue
+                    if _new_gid and gid == _new_gid:  # skip the just-created one
+                        continue
 
-                # General-tier overlap gate
-                tgt_gen_topic = set(
-                    self._canonicalize_label_list(target_labels.get("topic", []), "topic", tier="general").keys())
-                tgt_gen_tone = set(
-                    self._canonicalize_label_list(target_labels.get("tone", []), "tone", tier="general").keys())
-                tgt_gen_intent = set(
-                    self._canonicalize_label_list(target_labels.get("intent", []), "intent", tier="general").keys())
-                if not (
-                        cur_gen_topic & tgt_gen_topic or cur_gen_tone & tgt_gen_tone or cur_gen_intent & tgt_gen_intent):
+                    # Timestamp
+                    ts_str = label_file_path.stem.split("_")[0]
+                    try:
+                        ts = datetime.strptime(ts_str, "%Y%m%d").replace(tzinfo=timezone.utc)
+                    except Exception:
+                        ts = target_labels.get("timestamp")
+                        if isinstance(ts, str):
+                            try:
+                                ts = datetime.fromisoformat(ts)
+                            except Exception:
+                                ts = None
+                        if not isinstance(ts, datetime):
+                            ts = self._coerce_ts(label_file_path, target_labels, now)
+
+                    # General-tier overlap gate
+                    tgt_gen_topic = set(
+                        self._canonicalize_label_list(target_labels.get("topic", []), "topic", tier="general").keys())
+                    tgt_gen_tone = set(
+                        self._canonicalize_label_list(target_labels.get("tone", []), "tone", tier="general").keys())
+                    tgt_gen_intent = set(
+                        self._canonicalize_label_list(target_labels.get("intent", []), "intent", tier="general").keys())
+                    if not (
+                            cur_gen_topic & tgt_gen_topic or cur_gen_tone & tgt_gen_tone or cur_gen_intent & tgt_gen_intent):
+                        continue
+
+                    # Target canonical (specific)
+                    tgt_topics = self._canonicalize_label_list(target_labels.get("topic", []), "topic", tier="specific")
+                    tgt_tones = self._canonicalize_label_list(target_labels.get("tone", []), "tone", tier="specific")
+                    tgt_intents = self._canonicalize_label_list(target_labels.get("intent", []), "intent",
+                                                                tier="specific")
+
+                    # One call computes label-overlap (and optional cached-embedding blend)
+                    w_topic, w_tone, w_intent = 0.91, 0.03, 0.06
+                    sim = self._score_labels(
+                        {"topic": cur_topics, "tone": cur_tones, "intent": cur_intents},
+                        {"topic": tgt_topics, "tone": tgt_tones, "intent": tgt_intents},
+                        w_topic=w_topic, w_tone=w_tone, w_intent=w_intent,
+                        embed_weight=embed_weight,          # 0.0 in scan unless BB_EMBED_IN_SCAN=1
+                        cur_vecs=None if embed_weight == 0.0 else _cur_vecs,
+                        allow_api_for_tgt_vecs=False,       # cache-only even if enabled
+                    )
+
+                    if sim > 0.2:
+                        similarities.append({
+                            "gid": gid,
+                            "similarity": float(sim),
+                            "timestamp": ts,
+                            "label_file": label_file_path.name,
+                        })
+                        if getattr(self, "debug_similarity", False):
+                            print(f"[ctx] {gid} sim={sim:.4f}")
+
+                except Exception as e:
+                    print(f"[ctx] Error processing {label_file_path}: {e}")
                     continue
 
-                # Target canonical (specific)
-                tgt_topics = self._canonicalize_label_list(target_labels.get("topic", []), "topic", tier="specific")
-                tgt_tones = self._canonicalize_label_list(target_labels.get("tone", []), "tone", tier="specific")
-                tgt_intents = self._canonicalize_label_list(target_labels.get("intent", []), "intent", tier="specific")
-
-                # Weighted Jaccard
-                w_topic, w_tone, w_intent = 0.5, 0.2, 0.3
-                s_topic = self._weighted_jaccard(cur_topics, tgt_topics)
-                s_tone = self._weighted_jaccard(cur_tones, tgt_tones)
-                s_intent = self._weighted_jaccard(cur_intents, tgt_intents)
-                sim = w_topic * s_topic + w_tone * s_tone + w_intent * s_intent
-
-                # Optional cached-embedding cosine blend (applied once)
-                if embed_weight > 0.0 and (_cur_v_topic or _cur_v_tone or _cur_v_intent):
-                    tgt_v_topic = _cat_vec(tgt_topics)
-                    tgt_v_tone = _cat_vec(tgt_tones)
-                    tgt_v_intent = _cat_vec(tgt_intents)
-                    cos_score = (
-                            w_topic * _cos(_cur_v_topic, tgt_v_topic) +
-                            w_tone * _cos(_cur_v_tone, tgt_v_tone) +
-                            w_intent * _cos(_cur_v_intent, tgt_v_intent)
-                    )
-                    sim = (1.0 - embed_weight) * sim + embed_weight * cos_score
-
-                if sim > 0.0:
-                    similarities.append({
-                        "gid": gid,
-                        "similarity": float(sim),
-                        "timestamp": ts,
-                        "label_file": label_file_path.name,
-                    })
-                    if getattr(self, "debug_similarity", False):
-                        print(f"[ctx] {gid} sim={sim:.4f}")
-
-            except Exception as e:
-                print(f"[ctx] Error processing {label_file_path}: {e}")
-                continue
         self._dbg("end candidate scan")
-        # Sort & build context within budgets
-        similarities.sort(key=lambda x: x["similarity"], reverse=True)
+        if _PROFILE:
+            _log(f"similarities: {len(similarities)}")
+
+        # ---------- Sort & assemble context ----------
+        with PhaseTimer("sort_similarities", self._perf):
+            similarities.sort(key=lambda x: x["similarity"], reverse=True)
+
+        # Optional post-scan embedding rerank on top-K (fetch embeddings first)
+        if self.use_embedding_blend and self.embed_blend_weight > 0.0 and similarities:
+            t_r0 = time.time()
+            K = self.embed_rerank_topk if self.embed_rerank_topk > 0 else len(similarities)
+            head = similarities[:K]
+            self._dbg(f"rerank start: topK={K}, blend_w={self.embed_blend_weight}, api={self.embed_rerank_allow_api}")
+            # Collect all canonical labels we need embeddings for (current  targets)
+            needed = set(cur_topics.keys()) | set(cur_tones.keys()) | set(cur_intents.keys())
+            tgt_canon_cache: dict[str, tuple[dict[str, float], dict[str, float], dict[str, float]]] = {}
+            for item in head:
+                p = self.labels_dir / item["label_file"]
+                tgt = {}
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        tgt = json.load(f)
+                    tt = self._canonicalize_label_list(tgt.get("topic"), "topic", tier="specific")
+                    to = self._canonicalize_label_list(tgt.get("tone"), "tone", tier="specific")
+                    ti = self._canonicalize_label_list(tgt.get("intent"), "intent", tier="specific")
+                    tgt_canon_cache[item["label_file"]] = (tt, to, ti)
+                    # add targets to 'needed' so _ensure_embeddings_for can warm the cache
+                    needed |= set(tt.keys()) | set(to.keys()) | set(ti.keys())
+                except Exception as e:
+                    shapes = {k: type(v).__name__ for k, v in (tgt.items() if isinstance(tgt, dict) else []) if
+                              k in ("topic", "tone", "intent")}
+                    _log(f"[ctx] Error processing {p.name}: {e} | shapes={shapes}")
+                    continue
+            # Warm cache ONLY from local cache or simulated (no API by default)
+            self._ensure_embeddings_for(sorted(needed), allow_api=self.embed_rerank_allow_api)
+            # Build current category vectors once (helpers)
+            cur_v_topic  = self._cat_vec(cur_topics,  allow_api=self.embed_rerank_allow_api)
+            cur_v_tone   = self._cat_vec(cur_tones,   allow_api=self.embed_rerank_allow_api)
+            cur_v_intent = self._cat_vec(cur_intents, allow_api=self.embed_rerank_allow_api)
+
+            reranked = []
+            for item in head:
+                tt, to, ti = tgt_canon_cache.get(item["label_file"], ({}, {}, {}))
+                tvt = self._cat_vec(tt, allow_api=self.embed_rerank_allow_api)
+                tvo = self._cat_vec(to, allow_api=self.embed_rerank_allow_api)
+                tvi = self._cat_vec(ti, allow_api=self.embed_rerank_allow_api)
+                cos_score = (0.8 * self._cos(cur_v_topic,  tvt) +
+                             0.1 * self._cos(cur_v_tone,   tvo) +
+                             0.1 * self._cos(cur_v_intent, tvi))
+                new_sim = (1.0 - self.embed_blend_weight) * item["similarity"] + self.embed_blend_weight * cos_score
+                it2 = dict(item)
+                it2["similarity"] = float(new_sim)
+                reranked.append(it2)
+            similarities[:len(reranked)] = sorted(reranked, key=lambda x: x["similarity"], reverse=True)
+            self._dbg(f"rerank done in {time.time() - t_r0:.2f}s")
+
+        #ensure we can resolve gid -> chunk file quickly
+        with PhaseTimer("build_chunk_index", self._perf):
+            self._ensure_chunk_index()
 
         context_messages: List[Dict] = []
         recent_chars = 0
         long_chars = 0
 
-        for item in similarities:
-            chunk_content = self._load_chunk_by_gid(item["gid"]) or {}
-            text = chunk_content.get("content_text", "") or ""
-            L = len(text)
-            is_recent = (now - item["timestamp"]).days <= 7
-
-            if is_recent:
-                if recent_chars + L > min_chars_recent:
+        with PhaseTimer("assemble_context", self._perf):
+            block_t0 = time.perf_counter()
+            total = len(similarities)
+            for j, item in enumerate(similarities):
+                # I/O timing around chunk load
+                t_io0 = time.perf_counter()
+                try:
+                    chunk_content = self._load_chunk_by_gid(item["gid"]) or {}
+                except json.JSONDecodeError as e:
+                    _log(f"[assemble] JSON decode failed gid={item['gid']} -> {e}")
                     continue
-                recent_chars += L
-            else:
-                if long_chars + L > min_chars_long_term:
+                except Exception as e:
+                    _log(f"[assemble] load_chunk_by_gid({item['gid']}) error: {e}")
                     continue
-                long_chars += L
+                dt_io = time.perf_counter() - t_io0
+                self._metrics.io_calls += 1
+                self._metrics.io_time += dt_io
+                if _PROFILE and dt_io > _IO_WARN_SECS:
+                    _log(f"[assemble] slow chunk gid={item['gid']} took {dt_io:.2f}s")
+                text = (chunk_content.get("content_text") or "")
+                L = len(text)
+                is_recent = (now - item["timestamp"]).days <= 7
 
-            context_messages.append({
-                "gid": item["gid"],
-                "content": text,
-                "similarity": item["similarity"],
-                "timestamp": item["timestamp"].isoformat(),
-                "is_recent": is_recent,
-            })
+                if is_recent:
+                    if recent_chars + L > min_chars_recent:
+                        # still log progress so we can see it moving
+                        pass
+                    else:
+                        recent_chars += L
+                else:
+                    if long_chars + L > min_chars_long_term:
+                        pass
+                    else:
+                        long_chars += L
 
-            if recent_chars >= min_chars_recent and long_chars >= min_chars_long_term:
-                break
+                if ((is_recent and recent_chars <= min_chars_recent) or
+                        (not is_recent and long_chars <= min_chars_long_term)):
+                    context_messages.append({
+                        "gid": item["gid"],
+                        "content": text,
+                        "similarity": item["similarity"],
+                        "timestamp": item["timestamp"].isoformat(),
+                        "is_recent": is_recent,
+                    })
+
+                # progress ping
+                if _PROFILE and (j % _LOG_EVERY == 0 or j == total):
+                    dt = time.perf_counter() - block_t0
+                    _log(f"assemble {j}/{total} added={len(context_messages)} "
+                         f"recent={recent_chars}/{min_chars_recent} long={long_chars}/{min_chars_long_term} in {dt:.2f}s")
+                    heartbeat(f"assemble")
+
+                if recent_chars >= min_chars_recent and long_chars >= min_chars_long_term:
+                    break
 
         metadata = {
             "current_labels": current_labels,
-            "current_canonical": {
-                "topic": cur_topics, "tone": cur_tones, "intent": cur_intents
-            },
+            "current_canonical": {"topic": cur_topics, "tone": cur_tones, "intent": cur_intents},
             "total_similarities_found": len(similarities),
             "context_messages_included": len(context_messages),
             "recent_chars": recent_chars,
@@ -940,7 +1372,29 @@ class ContextSimilarityMatcher:
                     recent_chars >= min_chars_recent and long_chars >= min_chars_long_term
             ) else "exhausted_candidates",
         }
+
+        if _PROFILE:
+            total_time = sum(self._perf.values())
+            _log("PHASES: " + " | ".join(f"{k}={v:.3f}s" for k, v in self._perf.items()))
+            _log(f"TOTAL: {total_time:.3f}s | io_calls={self._metrics.io_calls} io_time={self._metrics.io_time:.3f}s")
+            if _MEM_SAMPLING and tracemalloc.is_tracing():
+                cur, peak = tracemalloc.get_traced_memory()
+                _log(f"mem: current={cur / 1e6:.1f}MB peak={peak / 1e6:.1f}MB")
+                tracemalloc.stop()
+            if _USE_HARD_FAULT:
+                faulthandler.cancel_dump_traceback_later()
+            else:
+                self._stop_soft_watchdog()
+
         return context_messages, metadata
+
+    def _cos(self, a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
+        if a is None or b is None:
+            return 0.0
+        da = float(np.linalg.norm(a)); db = float(np.linalg.norm(b))
+        if da == 0.0 or db == 0.0:
+            return 0.0
+        return float(np.dot(a, b) / (da * db))
 
     def _create_message_files(self, message: str, labels: Dict) -> Tuple[str, str]:
         """
@@ -988,18 +1442,25 @@ class ContextSimilarityMatcher:
         return chunk_file.name, label_file.name
     
     def _load_chunk_by_gid(self, gid: str) -> Optional[Dict]:
-        """Load chunk content by gid."""
-        # Search for chunk with matching gid
-        for chunk_file in self.chunks_dir.glob("*.json"):
-            try:
-                with open(chunk_file, 'r') as f:
-                    chunk = json.load(f)
-                    if chunk.get("gid") == gid:
-                        return chunk
-            except:
-                continue
-        
-        return None
+        """Load chunk content by gid using an index and a small in-memory cache."""
+        # cache hit
+        hit = self._chunk_cache.get(gid)
+        if hit is not None:
+            return hit
+        # index lookup
+        if self._chunk_index is None:
+            self._ensure_chunk_index()
+        path = self._chunk_index.get(gid) if self._chunk_index else None
+        if not path:
+            return None
+        with open(path, "r", encoding="utf-8-sig") as f:
+            obj = json.load(f)
+        # tiny LRU-ish cap
+        self._chunk_cache[gid] = obj
+        if len(self._chunk_cache) > int(os.getenv("BB_MATCHER_CHUNK_CACHE", "2048")):
+            # pop an arbitrary item (Python 3.7 dicts are insertion-ordered; this pops oldest)
+            self._chunk_cache.pop(next(iter(self._chunk_cache)))
+        return obj
     
     def build_context_header(
         self,
