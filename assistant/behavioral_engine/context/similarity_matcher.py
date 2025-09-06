@@ -160,6 +160,12 @@ class ContextSimilarityMatcher:
         else:
             self.embedding_cache_file = self.harmonization_dir / 'embedding_cache.pkl'
 
+        # Write-through persistence behavior for harmonization updates.
+        # Set BB_WRITE_THROUGH_HARMONIZATION=0 to disable immediate writes.
+        self.write_through_harmonization = bool(int(os.getenv("BB_WRITE_THROUGH_HARMONIZATION", "1")))
+        # tiny flag placeholder if you later want to coalesce writes
+        self._harm_pending = {"general": False, "specific": False}
+
         
         # Context parameters
         self.context_minimum_char_long_term = context_minimum_char_long_term
@@ -775,8 +781,17 @@ class ContextSimilarityMatcher:
         
         mapping[category][label] = group
         
-        # Save updated harmonization
-        self._save_harmonization_tier(tier)
+        # Write-through: persist immediately so a fresh full rebuild is unnecessary
+        self._maybe_save_harmonization(tier)
+
+    def _maybe_save_harmonization(self, tier: str):
+        """Persist the harmonization tier to disk if write-through is enabled."""
+        if getattr(self, "write_through_harmonization", True):
+            try:
+                self._save_harmonization_tier(tier)
+            except Exception as e:
+                _log(f"[harmonization] failed to save tier={tier}: {e}")
+
     
     def _save_harmonization_tier(self, tier: str):
         """Save updated harmonization tier."""
@@ -1307,6 +1322,8 @@ class ContextSimilarityMatcher:
         with PhaseTimer("assemble_context", self._perf):
             block_t0 = time.perf_counter()
             total = len(similarities)
+            debug_info: list[dict] = []
+            include_gids: list[str] = []
             for j, item in enumerate(similarities):
                 # I/O timing around chunk load
                 t_io0 = time.perf_counter()
@@ -1349,6 +1366,21 @@ class ContextSimilarityMatcher:
                         "is_recent": is_recent,
                     })
 
+                    include_gids.append(item["gid"])
+
+                # record a compact debug row for this candidate
+                debug_info.append({
+                    "gid": item["gid"],
+                    "label_file": item.get("label_file"),
+                    "similarity": float(item["similarity"]),
+                    "chunk_found": bool(chunk_content),
+                    "chunk_path": chunk_content.get("__path"),
+                    "content_len": L,
+                    "used_field": (chunk_content.get("__extract_diag") or {}).get("used_field"),
+                    "raw_parse": (chunk_content.get("__extract_diag") or {}).get("raw_parse"),
+                    "keys": [k for k in chunk_content.keys() if not k.startswith("__")][:12],
+                })
+
                 # progress ping
                 if _PROFILE and (j % _LOG_EVERY == 0 or j == total):
                     dt = time.perf_counter() - block_t0
@@ -1371,6 +1403,9 @@ class ContextSimilarityMatcher:
             "stopped_due_to": "char_budget" if (
                     recent_chars >= min_chars_recent and long_chars >= min_chars_long_term
             ) else "exhausted_candidates",
+            # NEW: surface GIDs + compact per-candidate diagnostics
+            "similar_message_gids": include_gids,
+            "similarity_debug": debug_info[:int(os.getenv("BB_MATCHER_DEBUG_LIMIT", "200"))],
         }
 
         if _PROFILE:
@@ -1440,7 +1475,149 @@ class ContextSimilarityMatcher:
             json.dump(label_data, f, indent=2)
         
         return chunk_file.name, label_file.name
-    
+
+    # ---------- Text extraction helpers ----------
+    def _coalesce_text_from_content(self, value):
+        """
+        Normalize text from common content shapes:
+          - str
+          - list of blocks: [{'type':'text','text': '...'}, ...]
+          - dict with 'parts': {'parts': ['a','b',...]} (legacy ChatML-ish)
+          - dict with 'text' or 'content' nesting
+        Returns a single string.
+        """
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            out = []
+            for item in value:
+                if isinstance(item, dict):
+                    # Prefer modern OpenAI content blocks
+                    if item.get("type") == "text" and isinstance(item.get("text"), str):
+                        out.append(item["text"])
+                    else:
+                        # Fallbacks
+                        t = item.get("text") or item.get("content")
+                        if isinstance(t, list):
+                            out += [str(x) for x in t]
+                        elif isinstance(t, str):
+                            out.append(t)
+                elif isinstance(item, (str, int, float)):
+                    out.append(str(item))
+            return "\n".join(x for x in out if x)
+        if isinstance(value, dict):
+            # Legacy ChatML-ish: {'parts': [...]}
+            if "parts" in value and isinstance(value["parts"], list):
+                return "\n".join(str(x) for x in value["parts"] if isinstance(x, (str, int, float)))
+            inner = value.get("text") or value.get("content") or value.get("message")
+            return self._coalesce_text_from_content(inner)
+        return ""
+
+    def _extract_text_with_diag(self, obj: dict) -> tuple[str, dict]:
+        """
+        Like _extract_text_from_chunk, but returns (text, diagnostics).
+        Diagnostics include which field/path was used and parse status for 'raw'.
+        """
+        diag = {
+            "used_field": None,
+            "raw_present": bool(obj.get("raw") or obj.get("raw_meta") or obj.get("raw_message")),
+            "raw_parse": "n/a",
+            "len": 0
+        }
+        # 1) Flat/near-flat fields
+        for key in ("content_text", "content", "text", "message"):
+            if key in obj and obj[key]:
+                t = self._coalesce_text_from_content(obj[key])
+                if t:
+                    diag["used_field"] = key
+                    diag["len"] = len(t)
+                    return t, diag
+
+        # 2) Raw envelope(s)
+        raw = obj.get("raw") or obj.get("raw_meta") or obj.get("raw_message")
+        if raw:
+            try:
+                raw_obj = json.loads(raw) if isinstance(raw, str) else raw
+                diag["raw_parse"] = "ok"
+            except Exception:
+                diag["raw_parse"] = "json_error"
+                return "", diag
+            if isinstance(raw_obj, dict):
+                for path in (("content",),
+                             ("message", "content"),
+                             ("data", "message", "content")):
+                    cur = raw_obj
+                    for p in path:
+                        if isinstance(cur, dict) and p in cur:
+                            cur = cur[p]
+                        else:
+                            cur = None
+                            break
+                    if cur is not None:
+                        t = self._coalesce_text_from_content(cur)
+                        if t:
+                            diag["used_field"] = "raw:" + ".".join(path)
+                            diag["len"] = len(t)
+                            return t, diag
+        return "", diag
+
+    def _extract_text_from_chunk(self, obj: dict) -> str:
+        """Best-effort extraction of human text from a chunk record.
+        Handles:
+          - flat fields: content_text, content, text, message
+          - OpenAI messages: {"content":[{"type":"text","text":"..."}]}
+          - legacy ChatML: {"content":{"content_type":"text","parts":["..."]}}
+          - objects under 'raw' (stringified JSON or nested dict)
+        """
+
+        def _from_content(value):
+            if isinstance(value, str):
+                return value
+            if isinstance(value, list):
+                parts = []
+                for item in value:
+                    if isinstance(item, dict):
+                        t = item.get("text") or item.get("content") or ""
+                        if isinstance(t, list):
+                            parts.extend([str(x) for x in t])
+                        elif isinstance(t, str):
+                            parts.append(t)
+                return "\n".join([p for p in parts if p])
+            if isinstance(value, dict):
+                if "parts" in value and isinstance(value["parts"], list):
+                    return "\n".join([str(x) for x in value["parts"] if isinstance(x, (str, int, float))])
+                inner = value.get("text") or value.get("content")
+                return _from_content(inner)
+            return ""
+
+        for key in ("content_text", "content", "text", "message"):
+            v = obj.get(key)
+            if v:
+                t = _from_content(v)
+                if t:
+                    return t
+
+        raw = obj.get("raw") or obj.get("raw_meta") or obj.get("raw_message")
+        if raw:
+            try:
+                raw_obj = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                raw_obj = None
+            if isinstance(raw_obj, dict):
+                for path in (("content",), ("message", "content"), ("data", "message", "content")):
+                    cur = raw_obj
+                    for p in path:
+                        if isinstance(cur, dict) and p in cur:
+                            cur = cur[p]
+                        else:
+                            cur = None
+                            break
+                    if cur is not None:
+                        t = _from_content(cur)
+                        if t:
+                            return t
+        return ""
+
     def _load_chunk_by_gid(self, gid: str) -> Optional[Dict]:
         """Load chunk content by gid using an index and a small in-memory cache."""
         # cache hit
@@ -1455,6 +1632,16 @@ class ContextSimilarityMatcher:
             return None
         with open(path, "r", encoding="utf-8-sig") as f:
             obj = json.load(f)
+        # Attach resolved path for debugging (not persisted to disk)
+        obj["__path"] = str(path)
+        # Ensure content_text is populated; also record diagnostics
+        if not obj.get("content_text"):
+            txt, diag = self._extract_text_with_diag(obj)
+            obj["content_text"] = txt or ""
+            obj["__extract_diag"] = diag
+        else:
+            obj["__extract_diag"] = {"used_field": "content_text", "raw_present": bool(obj.get("raw")),
+                                     "raw_parse": "n/a", "len": len(obj.get("content_text", ""))}
         # tiny LRU-ish cap
         self._chunk_cache[gid] = obj
         if len(self._chunk_cache) > int(os.getenv("BB_MATCHER_CHUNK_CACHE", "2048")):

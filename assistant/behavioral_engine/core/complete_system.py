@@ -473,12 +473,20 @@ class CompleteIntegratedSystem:
             label_file = f"{labels_dir}/{timestamp}_{msg_hash}.json"
 
             with open(label_file, 'w') as f:
-                json.dump({
+                payload = {
                     "raw_labels": raw_labels,
                     "harmonized": harmonized,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "similar_messages": similar_messages[:30000]  # Save top 3 similar messages
-                }, f, indent=2)
+                    # Keep your existing strings for readability
+                    "similar_messages": similar_messages[:30000],
+                    # NEW: include GIDs so you can trace which chunk files were consulted
+                    "similar_message_gids": (metadata.get("similar_message_gids", [])
+                                             if isinstance(metadata, dict) else []),
+                    # NEW: compact per-candidate diagnostics from the matcher (trim to keep file size sane)
+                    "similarity_debug": (metadata.get("similarity_debug", [])[:200]
+                                         if isinstance(metadata, dict) else [])
+                }
+                json.dump(payload, f, indent=2)
 
             # Count labels created
             total_labels = sum(len(items) for items in harmonized.values())
@@ -486,14 +494,18 @@ class CompleteIntegratedSystem:
 
             if self.needs_harmonization():
                 print(f"⚠️ Harmonization recommended: {self.labels_created_count - self.last_harmonization_count} new labels")
-                # Automatically update two-tier groups periodically
-                if self.labels_created_count - self.last_harmonization_count >= 1:
-                    print("🔄 Updating two-tier harmonization groups...")
-                    for category in ['topic', 'tone', 'intent']:
-                        self.harmonizer._update_harmonization_tier(category)
-                    self.harmonizer.save_harmonization_tiers()
-                    self.reset_harmonization_counter()
-                    print("   ✅ Two-tier groups updated")
+                # By default, skip the expensive full rebuild; rely on write-through during matching.
+                if os.getenv("BB_AUTO_REHARMONIZE", "0") == "1":
+                    if self.labels_created_count - self.last_harmonization_count >= 1:
+                        print("🔄 Updating two-tier harmonization groups...")
+                        for category in ['topic', 'tone', 'intent']:
+                            self.harmonizer._update_harmonization_tier(category)
+                        self.harmonizer.save_harmonization_tiers()
+                        self.reset_harmonization_counter()
+                        print("   ✅ Two-tier groups updated")
+                else:
+                    # Skipped full rebuild. Incremental write-through keeps harmonization files fresh.
+                    pass
 
         # Extract features
         features = self.feature_extractor.extract_message_features(
