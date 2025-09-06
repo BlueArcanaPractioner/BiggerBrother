@@ -286,6 +286,72 @@ class CompleteIntegratedSystem:
         if hasattr(self.harmonizer, 'embedding_cache'):
             print(f"   Cached embeddings: {len(self.harmonizer.embedding_cache)}")
 
+
+        # ---- Chat-mode defaults: keep sessions open, no auto-timeout
+        self.mode = "chat"
+        self.keepalive = True
+        try:
+            # Soft-configure schedulers if they expose knobs; ignore if not present.
+            if hasattr(self.context_scheduler, "configure"):
+                self.context_scheduler.configure(mode="chat", session_timeout=None, idle_autoclose=False)
+            elif hasattr(self.context_scheduler, "set_mode"):
+                self.context_scheduler.set_mode("chat")
+            if hasattr(self.adaptive_scheduler, "configure"):
+                self.adaptive_scheduler.configure(mode="chat", session_timeout=None)
+        except Exception as e:
+            print(f"[warn] scheduler chat-mode config skipped: {e}")
+
+    # --- Compose a conversational reply for chat mode -----------------------
+    def _compose_chat_reply(self, message: str, similar_messages: List[str], harmonized: Dict, max_ctx: int = 3) -> str:
+        """
+        Produce a user-facing reply that actually *uses* context and harmonized labels.
+        Never asks to end the session; designed for free-form chat.
+        """
+        # Summarize labels succinctly (specific groups first)
+        spec_topics = [l.get('specific_group', l.get('label')) for l in harmonized.get('topic', [])][:3]
+        tones       = [l.get('label') for l in harmonized.get('tone', [])][:2]
+        intents     = [l.get('label') for l in harmonized.get('intent', [])][:2]
+
+        ctx_snips = []
+        for s in similar_messages:
+            if not isinstance(s, str):
+                continue
+            txt = s.strip()
+            if not txt:
+                continue
+            # keep snippets short, plain
+            ctx_snips.append(txt)
+
+        sys_prompt = (
+            "You are a collaborator and friend. "
+            "Use the user's current message, the detected topics/tones/intents, and the context to compose a personalized message. "
+            "Be concrete and grounded in the context; do not invent details not implied by them. "
+            "DO NOT try to end the conversation or suggest ending; "
+            "keep the tone open-ended."
+        )
+
+        ctx_blob = json.dumps({
+            "topics_specific": spec_topics,
+            "tones": tones,
+            "intents": intents,
+            "context_snippets": ctx_snips
+        }, ensure_ascii=False)
+
+        try:
+            reply = self.openai_client.chat(
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user",   "content": f"CURRENT MESSAGE:\n{message}\n\nLABELED CONTEXT:\n{ctx_snips}"}
+                ],
+                model="gpt-4o"
+            )
+            return reply.strip()
+        except Exception as e:
+            # Fall back to a minimal, non-generic template
+            # (still contains detected topics so it isn't a blank platitude)
+            hint = ", ".join([t for t in spec_topics if t]) or "your themes"
+            return f"I hear you. Based on {hint}, I’ve pulled a few relevant notes from your history. Want to go deeper on one of these or take an actionable next step?"
+
     # ==================== NEW TWO-TIER CONTEXT METHODS ====================
 
     def get_similar_messages_for_context(self, message: str, current_labels: Dict[str, List[Dict]], limit: int = 10) -> List[str]:
@@ -431,6 +497,8 @@ class CompleteIntegratedSystem:
         # Add similar messages to context
         if similar_messages:
             print(f"   Found {len(similar_messages)} similar messages for context")
+        # Compose a user-facing chat reply (chat mode)
+        assistant_text = self._compose_chat_reply(message, similar_messages, harmonized)
 
         # Process based on active session type
         if self.active_check_in:
@@ -460,8 +528,35 @@ class CompleteIntegratedSystem:
             response = self.activity_logger.process_activity_description(message)
 
         else:
-            # Quick log with context
+            # Quick log with context (chat mode)
             response = self._quick_log_with_context(message, log_context, harmonized)
+            # If extractor produced nothing, ensure we still log a minimal session entry
+            try:
+                logged_any = bool(response.get("logged"))
+            except Exception:
+                logged_any = False
+            if not logged_any:
+                try:
+                    if hasattr(self.logbook, "log_entry"):
+                        self.logbook.log_entry(
+                            category_name="sessions",
+                            data={"summary": "chat_message", "tokens": len(message.split())},
+                            raw_text=message,
+                            extracted_by="chat_fallback"
+                        )
+                        response.setdefault("logged", []).append("sessions")
+                except Exception as e:
+                    print(f"[warn] fallback session log failed: {e}")
+
+            # Opportunistic passive scheduling: let scheduler sniff the message for tasks, but never close chat.
+            try:
+                if hasattr(self.scheduler, "process_message") and os.getenv("BB_CHAT_SCHEDULER", "1") == "1":
+                    sched_out = self.scheduler.process_message(message)
+                    # attach a light summary if it exists
+                    if isinstance(sched_out, dict):
+                        response["scheduler"] = {k: v for k, v in sched_out.items() if k in ("tasks", "labels", "context_size") or isinstance(v, (str, int, float, list, dict))}
+            except Exception as e:
+                print(f"[warn] scheduler passive call skipped: {e}")
 
         # Save harmonized labels to disk
         if harmonized:
@@ -473,19 +568,28 @@ class CompleteIntegratedSystem:
             label_file = f"{labels_dir}/{timestamp}_{msg_hash}.json"
 
             with open(label_file, 'w') as f:
+                # Try to fetch the gid for *this* message from the matcher's just-created label file
+                cur_gid = None
+                try:
+                    if isinstance(metadata, dict) and metadata.get("label_file"):
+                        lf = Path(self.paths.get("labels", labels_dir)) / metadata["label_file"]
+                        with open(lf, "r", encoding="utf-8") as _lf:
+                            cur_gid = (json.load(_lf) or {}).get("gid")
+                except Exception:
+                    pass
+
                 payload = {
+                    "gid": cur_gid,
                     "raw_labels": raw_labels,
                     "harmonized": harmonized,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    # Keep your existing strings for readability
-                    "similar_messages": similar_messages[:30000],
-                    # NEW: include GIDs so you can trace which chunk files were consulted
-                    "similar_message_gids": (metadata.get("similar_message_gids", [])
-                                             if isinstance(metadata, dict) else []),
-                    # NEW: compact per-candidate diagnostics from the matcher (trim to keep file size sane)
-                    "similarity_debug": (metadata.get("similarity_debug", [])[:200]
-                                         if isinstance(metadata, dict) else [])
+                    "similar_messages": similar_messages[:30000]
                 }
+                if isinstance(metadata, dict):
+                    if metadata.get("similar_message_gids"):
+                        payload["similar_message_gids"] = metadata["similar_message_gids"]
+                    if metadata.get("similarity_debug"):
+                        payload["similarity_debug"] = metadata["similarity_debug"][:200]
                 json.dump(payload, f, indent=2)
 
             # Count labels created
@@ -513,6 +617,9 @@ class CompleteIntegratedSystem:
             datetime.now(timezone.utc)
         )
 
+        response["response"] = assistant_text  # <-- ensure chat has an actual reply
+        response["keep_alive"] = True  # <-- front-end can use this to avoid auto-closing chat
+        response["mode"] = "chat"
         response["features"] = {
             "vocabulary_richness": features.vocabulary_richness,
             "rare_words": features.rare_word_count,
