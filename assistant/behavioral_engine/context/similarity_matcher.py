@@ -272,16 +272,54 @@ class ContextSimilarityMatcher:
             return
         idx: Dict[str, Path] = {}
         t0 = time.perf_counter()
-        for chunk_file in self.chunks_dir.glob("*.json"):
+
+        # Primary dir + optional extra dirs (use ; or : to separate)
+        extra = os.getenv("BB_MATCHER_EXTRA_CHUNK_DIRS", "")
+        scan_dirs = [self.chunks_dir] + [Path(p) for p in re.split(r"[;:]", extra) if p.strip()]
+        seen: set[str] = set()
+
+        for root in scan_dirs:
             try:
-                # read minimal to get gid; utf-8-sig handles BOM if present
-                with open(chunk_file, "r", encoding="utf-8-sig") as f:
-                    obj = json.load(f)
-                gid = obj.get("gid")
-                if gid:
-                    idx[gid] = chunk_file
+                root = Path(root)
             except Exception:
                 continue
+            if not root.exists():
+                continue
+
+            for chunk_file in root.glob("*.json"):
+                try:
+                    with open(chunk_file, "r", encoding="utf-8-sig") as f:
+                        obj = json.load(f)
+                except Exception:
+                    continue
+
+                # 1) native ChunkRecord gid (our writer)
+                gids: list[str] = []
+                g = obj.get("gid")
+                if g:
+                    gids.append(str(g))
+
+                # 2) export shape: conversation_id + seq -> "{conversation_id}#{seq:06d}"
+                conv = obj.get("conversation_id")
+                seq = obj.get("seq")
+                if conv is not None and seq is not None:
+                    try:
+                        seq_i = int(seq)
+                        gids.append(f"{conv}#{seq_i:06d}")
+                    except Exception:
+                        gids.append(f"{conv}#{seq}")
+
+                # 3) filename-as-gid fallback for exports already named like "...#000019.json"
+                stem = chunk_file.stem
+                if "#" in stem:
+                    gids.append(stem)
+
+                for gid in gids:
+                    if not gid or gid in seen:
+                        continue
+                    idx[gid] = chunk_file
+                    seen.add(gid)
+
         self._chunk_index = idx
         if _PROFILE:
             _log(f"built chunk index: {len(idx)} files in {time.perf_counter()-t0:.2f}s")
@@ -1628,16 +1666,51 @@ class ContextSimilarityMatcher:
         if self._chunk_index is None:
             self._ensure_chunk_index()
         path = self._chunk_index.get(gid) if self._chunk_index else None
+        diag = ""
+
+        # Fallbacks: try direct filenames if not indexed
         if not path:
+            candidates = [self.chunks_dir / f"{gid}.json"]
+            if gid.startswith("msg_"):
+                candidates.append(self.chunks_dir / (gid[4:] + ".json"))
+            extra = os.getenv("BB_MATCHER_EXTRA_CHUNK_DIRS", "")
+            for base in [Path(p) for p in re.split(r"[;:]", extra) if p.strip()]:
+                candidates.append(Path(base) / f"{gid}.json")
+                if gid.startswith("msg_"):
+                    candidates.append(Path(base) / (gid[4:] + ".json"))
+
+            for cand in candidates:
+                try:
+                    if cand.exists():
+                        with open(cand, "r", encoding="utf-8-sig") as f:
+                            obj = json.load(f)
+                        obj.setdefault("gid", gid)
+                        obj["__path"] = str(cand)
+                        # Ensure content_text is populated
+                        if not obj.get("content_text"):
+                            # use diagnostic extractor if present
+                            if hasattr(self, "_extract_text_with_diag"):
+                                txt, diag = self._extract_text_with_diag(obj)
+                                obj["content_text"] = txt or ""
+                                obj["__extract_diag"] = diag
+                            else:
+                                obj["content_text"] = self._extract_text_from_chunk(obj)
+                        self._chunk_cache[gid] = obj
+                        return obj
+                except Exception:
+                    pass
             return None
+
         with open(path, "r", encoding="utf-8-sig") as f:
             obj = json.load(f)
-        # Attach resolved path for debugging (not persisted to disk)
         obj["__path"] = str(path)
-        # Ensure content_text is populated; also record diagnostics
         if not obj.get("content_text"):
-            txt, diag = self._extract_text_with_diag(obj)
-            obj["content_text"] = txt or ""
+            if hasattr(self, "_extract_text_with_diag"):
+                txt, diag = self._extract_text_with_diag(obj)
+                obj["content_text"] = txt or ""
+                obj["__extract_diag"] = diag
+            else:
+                obj["content_text"] = self._extract_text_from_chunk(obj)
             obj["__extract_diag"] = diag
         else:
             obj["__extract_diag"] = {"used_field": "content_text", "raw_present": bool(obj.get("raw")),
