@@ -31,6 +31,7 @@ from assistant.graph.store import GraphStore
 from assistant.logger.temporal_personal_profile import TemporalPersonalProfile
 from assistant.conversational_logger import CheckInType
 
+# Import BOTH schedulers for full functionality
 from assistant.behavioral_engine.schedulers.adaptive_scheduler import AdaptiveScheduler
 from assistant.behavioral_engine.schedulers.context_aware_scheduler import ContextAwareScheduler
 from assistant.behavioral_engine.schedulers.schedule_bridge import ScheduleBridge
@@ -288,92 +289,80 @@ class CompleteIntegratedSystem:
         if hasattr(self.harmonizer, 'embedding_cache'):
             print(f"   Cached embeddings: {len(self.harmonizer.embedding_cache)}")
 
+            # ---- Chat-mode defaults: keep sessions open, no auto-timeout
+            self.mode = "chat"
+            self.keepalive = True
+            try:
+                # Soft-configure schedulers if they expose knobs; ignore if not present.
+                if hasattr(self.context_scheduler, "configure"):
+                    self.context_scheduler.configure(mode="chat", session_timeout=None, idle_autoclose=False)
+                elif hasattr(self.context_scheduler, "set_mode"):
+                    self.context_scheduler.set_mode("chat")
+                if hasattr(self.adaptive_scheduler, "configure"):
+                    self.adaptive_scheduler.configure(mode="chat", session_timeout=None)
+            except Exception as e:
+                print(f"[warn] scheduler chat-mode config skipped: {e}")
 
-        # ---- NEW: Scheduler Bridge (notes → suggestions → crystallize → email)
-        self.schedule_bridge = ScheduleBridge(
-            planner_dir=planner_dir,
-            openai_client=self.openai_client
-        )
+        # --- Compose a conversational reply for chat mode -----------------------
+        def _compose_chat_reply(self, message: str, similar_messages: List[str], harmonized: Dict,
+                                max_ctx: int = 300) -> str:
+            """
+            Produce a user-facing reply that actually *uses* context and harmonized labels.
+            Never asks to end the session; designed for free-form chat.
+            """
+            # Summarize labels succinctly (specific groups first)
+            spec_topics = [l.get('specific_group', l.get('label')) for l in harmonized.get('topic', [])][:3]
+            tones = [l.get('label') for l in harmonized.get('tone', [])][:2]
+            intents = [l.get('label') for l in harmonized.get('intent', [])][:2]
 
-        # ---- NEW: make sure 'sessions' exists for fallback chat logging
-        try:
-            self._ensure_log_category(
-                "sessions",
-                description="Freeform chat sessions (auto-created)",
-                fields={"summary": "string", "tokens": "int"}
+            ctx_snips = []
+            for s in similar_messages:
+                if not isinstance(s, str):
+                    continue
+                txt = s.strip()
+                if not txt:
+                    continue
+                # keep snippets short, plain
+                ctx_snips.append(txt)
+
+            sys_prompt = (
+                "You are a helpful assistant replying in free-form chat mode. "
+                "Use the user's current message and the context of similar messages from history to form a personalized response."
+                "Be concrete and grounded in the context; do not invent details not implied by them. "
+                "DO NOT try to end the conversation or suggest ending; "
+                "keep the tone open-ended."
             )
-        except Exception as e:
-            print(f"[warn] could not ensure 'sessions' category: {e}")
 
+            ctx_blob = json.dumps({
+                "context_snippets": ctx_snips
+            }, ensure_ascii=False)
 
-        # ---- Chat-mode defaults: keep sessions open, no auto-timeout
-        self.mode = "chat"
-        self.keepalive = True
-        try:
-            # Soft-configure schedulers if they expose knobs; ignore if not present.
-            if hasattr(self.context_scheduler, "configure"):
-                self.context_scheduler.configure(mode="chat", session_timeout=None, idle_autoclose=False)
-            elif hasattr(self.context_scheduler, "set_mode"):
-                self.context_scheduler.set_mode("chat")
-            if hasattr(self.adaptive_scheduler, "configure"):
-                self.adaptive_scheduler.configure(mode="chat", session_timeout=None)
-        except Exception as e:
-            print(f"[warn] scheduler chat-mode config skipped: {e}")
+            try:
+                reply = self.openai_client.chat(
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": f"CURRENT MESSAGE:\n{message}\n\nCONTEXT:\n{ctx_blob}"}
+                    ],
+                    model="gpt-5"
+                )
+                return reply.strip()
+            except Exception as e:
+                # Fall back to a minimal, non-generic template
+                # (still contains detected topics so it isn't a blank platitude)
+                hint = ", ".join([t for t in spec_topics if t]) or "your themes"
+                return f"I hear you. Based on {hint}, I’ve pulled a few relevant notes from your history. Want to go deeper on one of these or take an actionable next step?"
 
-    # --- Compose a conversational reply for chat mode -----------------------
-    def _compose_chat_reply(self, message: str, similar_messages: List[str], harmonized: Dict, max_ctx: int = 3) -> str:
-        """
-        Produce a user-facing reply that actually *uses* context and harmonized labels.
-        Never asks to end the session; designed for free-form chat.
-        """
-        # Summarize labels succinctly (specific groups first)
-        spec_topics = [l.get('specific_group', l.get('label')) for l in harmonized.get('topic', [])][:3]
-        tones       = [l.get('label') for l in harmonized.get('tone', [])][:2]
-        intents     = [l.get('label') for l in harmonized.get('intent', [])][:2]
+        # ---- NEW: timezone & scheduler bridge ----
+        self.tz = ZoneInfo(os.getenv("BB_TZ", "America/Kentucky/Louisville"))
+        self.schedule_bridge = ScheduleBridge(planner_dir=planner_dir, openai_client=self.openai_client)
+        self.active_planning: dict | None = None  # holds a working schedule state during chat
 
-        ctx_snips = []
-        for s in similar_messages:
-            if not isinstance(s, str):
-                continue
-            txt = s.strip()
-            if not txt:
-                continue
-            # keep snippets short, plain
-            ctx_snips.append(txt)
-
-        sys_prompt = (
-            "You are a collaborator and friend. "
-            "Use the user's current message, and the context to compose a personalized message. "
-            "Be concrete and grounded in the context; do not invent details not implied by them. "
-            "DO NOT try to end the conversation or suggest ending; "
-            "keep the tone open-ended."
-        )
-
-        ctx_blob = json.dumps({
-            "topics_specific": spec_topics,
-            "tones": tones,
-            "intents": intents,
-            "context_snippets": ctx_snips
-        }, ensure_ascii=False)
-
-        try:
-            reply = self.openai_client.chat(
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user",   "content": f"CURRENT MESSAGE:\n{message}\n\nLABELED CONTEXT:\n{ctx_snips}"}
-                ],
-                model="gpt-5"
-            )
-            return reply.strip()
-        except Exception as e:
-            # Fall back to a minimal, non-generic template
-            # (still contains detected topics so it isn't a blank platitude)
-            hint = ", ".join([t for t in spec_topics if t]) or "your themes"
-            return f"I hear you. Based on {hint}, I’ve pulled a few relevant notes from your history. Want to go deeper on one of these or take an actionable next step?"
+        # ---- NEW: ensure default categories exist (auto-create if missing) ----
+        self._ensure_default_log_categories()
 
     # ==================== NEW TWO-TIER CONTEXT METHODS ====================
 
-    def get_similar_messages_for_context(self, message: str, current_labels: Dict[str, List[Dict]], limit: int = 100) -> List[str]:
+    def get_similar_messages_for_context(self, message: str, current_labels: Dict[str, List[Dict]], limit: int = 10) -> List[str]:
         # Delegate to the new matcher
         context_messages, metadata = self.context_matcher.find_similar_messages(
             message=message,  # We already have labels, could refactor this
@@ -513,21 +502,8 @@ class CompleteIntegratedSystem:
                     if entries:
                         log_context[category] = entries
 
-        # Add similar messages to context (debug print)
-        if similar_messages:
-            print(f"   Found {len(similar_messages)} similar messages for context")
 
-        # ---- NEW: Capture schedule-worthy note opportunistically
-        schedule_note = None
-        try:
-            intents = [l.get("label","").lower() for l in harmonized.get("intent", [])]
-            text_l = message.lower()
-            _triggers = {"plan", "planning", "plan_next_steps", "schedule", "scheduling", "appointment"}
-            if any(t in intents for t in _triggers) or any(w in text_l for w in ("schedule", "plan", "appointment", "tomorrow", "today")):
-                schedule_note = self.schedule_bridge.capture_note(message, harmonized, source="chat")
-        except Exception as e:
-            print(f"[warn] schedule note capture failed: {e}")
-        # Compose a user-facing chat reply (chat mode)
+        #Compose a user-facing chat reply (chat mode)
         assistant_text = self._compose_chat_reply(message, similar_messages, harmonized)
 
         # Process based on active session type
@@ -579,14 +555,33 @@ class CompleteIntegratedSystem:
                     print(f"[warn] fallback session log failed: {e}")
 
             # Opportunistic passive scheduling: let scheduler sniff the message for tasks, but never close chat.
+
             try:
                 if hasattr(self.scheduler, "process_message") and os.getenv("BB_CHAT_SCHEDULER", "1") == "1":
                     sched_out = self.scheduler.process_message(message)
                     # attach a light summary if it exists
                     if isinstance(sched_out, dict):
-                        response["scheduler"] = {k: v for k, v in sched_out.items() if k in ("tasks", "labels", "context_size") or isinstance(v, (str, int, float, list, dict))}
+                        response["scheduler"] = {k: v for k, v in sched_out.items() if
+                                                 k in ("tasks", "labels", "context_size") or isinstance(v,
+                                                                                                        (str, int, float, list,
+                                                                                                         dict))}
+
             except Exception as e:
                 print(f"[warn] scheduler passive call skipped: {e}")
+
+            # Planning triggers → maintain a draft schedule while user discusses the day
+            plan = response.get("planning", {})
+            if plan.get("trigger") in ("start", "continue") or response.get("schedule_suggestions"):
+                suggestions = response.get("schedule_suggestions", [])
+                # Create/update working planning state
+                self.active_planning = self.active_planning or {"started_at": datetime.now(timezone.utc).isoformat()}
+                draft = self.schedule_bridge.append_suggestions(suggestions)
+                response["planning"] = {"state": "draft", "date": draft["date"], "tasks": draft["tasks"]}
+
+            if plan.get("trigger") == "finalize":
+                finalized = self.schedule_bridge.finalize_draft(tz=str(self.tz), send_emails=True)
+                self.active_planning = None
+                response["planning"] = {"state": "finalized", **finalized}
 
         # Save harmonized labels to disk
         if harmonized:
@@ -613,14 +608,19 @@ class CompleteIntegratedSystem:
                     "raw_labels": raw_labels,
                     "harmonized": harmonized,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "similar_messages": similar_messages[:30000]
+                    # Keep your existing strings for readability
+                    "similar_messages": similar_messages[:30000],
+                    # NEW: include GIDs so you can trace which chunk files were consulted
+                    "similar_message_gids": (metadata.get("similar_message_gids", [])
+                                             if isinstance(metadata, dict) else []),
+                    # NEW: compact per-candidate diagnostics from the matcher (trim to keep file size sane)
+                    "similarity_debug": (metadata.get("similarity_debug", [])[:200]
+                                         if isinstance(metadata, dict) else [])
                 }
-                if isinstance(metadata, dict):
-                    if metadata.get("similar_message_gids"):
-                        payload["similar_message_gids"] = metadata["similar_message_gids"]
-                    if metadata.get("similarity_debug"):
-                        payload["similarity_debug"] = metadata["similarity_debug"][:200]
+
                 json.dump(payload, f, indent=2)
+
+
 
             # Count labels created
             total_labels = sum(len(items) for items in harmonized.values())
@@ -650,11 +650,6 @@ class CompleteIntegratedSystem:
         response["response"] = assistant_text  # <-- ensure chat has an actual reply
         response["keep_alive"] = True  # <-- front-end can use this to avoid auto-closing chat
         response["mode"] = "chat"
-        # Keep chat sessions open; some UIs treat missing field as 'end'
-        response.setdefault("response", "")
-        response["keep_alive"] = True
-        response["mode"] = "chat"
-
         response["features"] = {
             "vocabulary_richness": features.vocabulary_richness,
             "rare_words": features.rare_word_count,
@@ -673,16 +668,6 @@ class CompleteIntegratedSystem:
         #print(f"{response}")
         if log_context:
             response["log_context_loaded"] = list(log_context.keys())
-
-        # Surface schedule-bridge note id if we captured one
-        if schedule_note:
-            response["schedule_note_id"] = schedule_note["id"]
-
-        # Let the scheduler bridge send any reminders that are now due
-        try:
-            self.schedule_bridge.reminders.tick()
-        except Exception:
-            pass
 
         return response
 
@@ -787,9 +772,10 @@ class CompleteIntegratedSystem:
 
     def _quick_log_with_context(self, message: str, context: Dict, harmonized: Dict = None) -> Dict:
         """
-        Quick log with relevant context loaded.
-        Uses harmonized labels to improve extraction.
+        Quick log with relevant context; ALSO extracts schedule suggestions, planning triggers,
+        inventory updates, and load-context requests. Auto-creates categories as needed.
         """
+        prompt = ""
         # Build context prompt
         context_prompt = ""
         if context:
@@ -803,13 +789,29 @@ class CompleteIntegratedSystem:
             context_prompt += f"\nDetected topics (specific): {specific_topics[:3]}"
             context_prompt += f"\nDetected themes (general): {list(set(general_topics))[:3]}"
 
-        # Extract with context
-        prompt = f"""Extract structured data from this message.
+            # NEW: rich extractor schema
+            prompt = f"""You are a structured extractor for a personal assistant. Return ONE JSON object matching:
+        {{
+          "entries": [{{"category": "string", "data": {{}}, "confidence": 0-1}}],
+          "schedule_suggestions": [{{"title": "string", "duration_min": 30, "preferred_time": "HH:MM|null", "day": "today|YYYY-MM-DD|null"}}],
+          "triggers": {{"planning": "start|continue|finalize|none"}},
+          "load_context": [{{"category": "string", "days_back": 7, "max_entries": 200}}],
+          "inventory_updates": [{{"category": "inventory_pantry|inventory_house|inventory_car|inventory_tools|inventory_medications", "item": "string", "qty": 1, "unit": "string"}}]
+        }}
+
+        Guidelines:
+        - Use existing log categories when possible: medications, meals, exercise, mood, sleep, productivity, symptoms.
+        - Also allowed: appointments, health, travel_times, places, work_hours, insurance, job, diet, nutrition_macros, nutrition_micros,
+          recipes, skills, micro_skills, finance_income, finance_expenses, inventory_* categories listed above.
+        - If the user is discussing making a plan or schedule (keywords like schedule, plan, appointment, tomorrow, today) OR intent resembles planning,
+          set triggers.planning to "start" or "continue". If user approves a proposed plan (e.g., 'looks good', 'finalize schedule'),
+          set triggers.planning to "finalize".
+        - For schedule_suggestions, prefer concise titles and realistic durations. preferred_time is optional.
+
+        Now extract from:
         {context_prompt}
-        
-        Message: {message}
-        
-        Extract and categorize activities."""
+        MESSAGE:\n{message}
+        """
 
         try:
             response = self.openai_client.chat(
@@ -821,37 +823,66 @@ class CompleteIntegratedSystem:
             )
 
             # Parse and log
-            extracted = json.loads(response) if response.startswith('[') or response.startswith('{') else {"entries": []}
+            content = response.strip()
+            if "```json" in content:  # defensive for markdown code fences
+                content = content.split("```json")[1].split("```")[0]
+            extracted = json.loads(content) if content.startswith('{') else {"entries": []}
             logged = []
 
+            # --- ensure categories and write entries ---
             for item in extracted.get("entries", []):
                 category = item.get("category")
-                # NEW: auto-create category if missing
                 if category and category not in self.logbook.categories:
                     try:
-                        self._ensure_log_category(category, description=f"Auto-created by extractor", fields={})
+                        self._ensure_log_category(category, description="Auto-created by extractor", fields={})
                     except Exception as e:
                         print(f"[warn] could not create log category '{category}': {e}")
                 if category in self.logbook.categories:
-                    self.logbook.log_entry(
-                        category_name=category,
-                        data=item.get("data", {}),
-                        raw_text=message,
-                        extracted_by="quick_log"
-                    )
-                    logged.append(category)
+                    try:
+                        self.logbook.log_entry(category_name=category, data=item.get("data", {}),
+                                               raw_text=message, extracted_by="quick_log",
+                                               confidence=item.get("confidence", 0.8))
+                        logged.append(category)
+                    except Exception as e:
+                        print(f"[warn] logging to {category} failed: {e}")
 
-            # Minimal fallback: always record that we saw a chat message
+            # --- optional: inventory updates as plain entries ---
+            for inv in extracted.get("inventory_updates", []):
+                cat = inv.get("category") or "inventory_misc"
+                if cat not in self.logbook.categories:
+                    try:
+                        self._ensure_log_category(cat, description="Auto-created inventory", fields={})
+                    except Exception:
+                        pass
+                if cat in self.logbook.categories:
+                    data = {k: v for k, v in inv.items() if k not in ("category",)}
+                    try:
+                        self.logbook.log_entry(category_name=cat, data=data, raw_text=message, extracted_by="inventory")
+                        logged.append(cat)
+                    except Exception as e:
+                        print(f"[warn] inventory log failed: {e}")
+
+            # --- schedule suggestions pass-through ---
+            sched_suggestions = extracted.get("schedule_suggestions", [])
+            planning_trigger = (extracted.get("triggers") or {}).get("planning", "none")
+
+            # --- load-context requests ---
+            loaded_context = {}
+            for req in extracted.get("load_context", []):
+                cat = req.get("category");
+                db = int(req.get("days_back", 7));
+                mx = int(req.get("max_entries", 200))
+                if cat and cat in self.logbook.categories:
+                    loaded_context[cat] = self.logbook.load_category_context(cat, days_back=db, max_entries=mx) or []
+
+            # minimal fallback session log if nothing landed
             if not logged:
                 try:
                     self._ensure_log_category("sessions", description="Freeform chat sessions (auto-created)",
                                               fields={"summary": "string", "tokens": "int"})
-                    self.logbook.log_entry(
-                        category_name="sessions",
-                        data={"summary": "chat_message", "tokens": len(message.split())},
-                        raw_text=message,
-                        extracted_by="chat_fallback"
-                    )
+                    self.logbook.log_entry(category_name="sessions",
+                                           data={"summary": "chat_message", "tokens": len(message.split())},
+                                           raw_text=message, extracted_by="chat_fallback")
                     logged.append("sessions")
                 except Exception as e:
                     print(f"[warn] fallback session log failed: {e}")
@@ -859,6 +890,9 @@ class CompleteIntegratedSystem:
             return {
                 "logged": logged,
                 "extracted": extracted.get("entries", []),
+                "schedule_suggestions": sched_suggestions,
+                "planning": {"trigger": planning_trigger},
+                "loaded_context": loaded_context,
                 "context_used": list(context.keys()) if context else []
             }
 
@@ -867,42 +901,35 @@ class CompleteIntegratedSystem:
             return {"error": str(e)}
 
 
-    # --------- NEW: public helpers to use the Scheduler Bridge ----------
-    def review_schedule_notes_for_day(self, date=None) -> Dict:
-        """Return schedule suggestions from captured notes for the given day (local ET by default)."""
-        return self.schedule_bridge.get_suggestions_for_day(date)
 
-    def crystallize_schedule_for_day(self, tasks: List[Dict], date=None,
-                                     tz: str = "America/New_York", send_emails: bool = True) -> Dict:
-        """Finalize a day's schedule and queue email reminders at task start."""
-        return self.schedule_bridge.crystallize_schedule(tasks, date=date, tz=tz, send_emails=send_emails)
-
+    # ---------- Category helpers ----------
     def _ensure_log_category(self, name: str, description: str = "", fields: Optional[Dict[str, Any]] = None):
-        """Create a logbook category if missing (tries logbook API, then falls back to filesystem)."""
-        if hasattr(self.logbook, "categories") and name in self.logbook.categories:
-            return
+        if hasattr(self.logbook, "categories") and name in self.logbook.categories: return
         fields = fields or {}
-        # Try DynamicLogBook's own APIs if present
         for method in ("create_category", "ensure_category", "register_category"):
             if hasattr(self.logbook, method):
-                try:
-                    getattr(self.logbook, method)(name=name, description=description, fields=fields)
-                    return
-                except Exception as e:
-                    print(f"[warn] logbook.{method} failed for '{name}': {e}")
-        # Filesystem fallback: create directory + seed files, then ask logbook to reload
+                try: getattr(self.logbook, method)(name=name, description=description, fields=fields); return
+                except Exception as e: print(f"[warn] logbook.{method} failed for '{name}': {e}")
         cat_dir = Path(self.paths["logbooks"]) / name
         cat_dir.mkdir(parents=True, exist_ok=True)
-        readme = (cat_dir / "README.md")
-        if not readme.exists():
-            readme.write_text(f"# {name}\n\n{description}\n", encoding="utf-8")
         (cat_dir / f"{name}.jsonl").touch(exist_ok=True)
-        # Try to reload categories if supported
+        (cat_dir / "README.md").write_text(f"# {name}\n\n{description}\n", encoding="utf-8")
         if hasattr(self.logbook, "reload_categories"):
-            try:
-                self.logbook.reload_categories()
-            except Exception:
-                pass
+            try: self.logbook.reload_categories()
+            except Exception: pass
+
+    def _ensure_default_log_categories(self):
+        defaults = [
+            "sessions","medications","meals","exercise","mood","sleep","productivity","symptoms",
+            "appointments","health","travel_times","places","work_hours","insurance","job","diet",
+            "nutrition_macros","nutrition_micros","recipes","skills","micro_skills",
+            "finance_income","finance_expenses",
+            "inventory_pantry","inventory_house","inventory_car","inventory_tools","inventory_medications"
+        ]
+        for c in defaults:
+            try: self._ensure_log_category(c, description="auto")
+            except Exception: pass
+
 
     # Convenience methods for AdaptiveScheduler functionality
     def analyze_behavioral_patterns(self, days: int = 30):
