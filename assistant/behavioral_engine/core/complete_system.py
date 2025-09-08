@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from collections import defaultdict
 import dotenv
+import re
 
 # Use app's OpenAI client (with API quirks handling)
 from app.openai_client import OpenAIClient
@@ -53,6 +54,73 @@ from assistant.behavioral_engine.logbooks.dynamic_logbook_system import (
 from assistant.behavioral_engine.intents.intent_dispatcher import handle_incoming_text
 
 dotenv.load_dotenv()
+
+# ---- Minimal probing spec: which fields we care about and how to ask for them
+PROBE_SPECS = {
+    "sleep": {
+        "fields": ["bedtime", "wake_time", "sleep_quality"],
+        "questions": {
+            "bedtime": "What time did you go to bed last night?",
+            "wake_time": "What time did you wake up today?",
+            "sleep_quality": "How did you sleep (1–5)?"
+        }
+    },
+    "medications": {
+        "fields": ["medication", "dose", "time"],
+        "questions": {
+            "medication": "Which medication did you take?",
+            "dose": "What dose did you take?",
+            "time": "About what time did you take it?"
+        }
+    },
+    "meals": {
+        "fields": ["meal", "calories", "protein_g"],
+        "questions": {
+            "meal": "What did you eat most recently?",
+            "calories": "About how many calories was it?",
+            "protein_g": "Roughly how much protein did you get (grams)?"
+        }
+    },
+    "mood": {
+        "fields": ["mood", "score"],
+        "questions": {
+            "mood": "How would you describe your mood right now?",
+            "score": "If you had to score it 1–10, what would you pick?"
+        }
+    },
+    "productivity": {
+        "fields": ["tasks_completed", "blockers", "pomodoros"],
+        "questions": {
+            "tasks_completed": "What’s one thing you finished recently?",
+            "blockers": "Is anything currently blocking you?",
+            "pomodoros": "How many focus blocks did you get in?"
+        }
+    },
+    "appointments": {
+        "fields": ["title", "when", "location"],
+        "questions": {
+            "title": "What’s the title of the appointment?",
+            "when": "When is it scheduled?",
+            "location": "Where is it?"
+        }
+    },
+    "work_hours": {
+        "fields": ["start", "end"],
+        "questions": {
+            "start": "When did you start work?",
+            "end": "When did you wrap up?"
+        }
+    },
+    "symptoms": {
+        "fields": ["symptom", "intensity", "onset_time"],
+        "questions": {
+            "symptom": "What symptom did you notice?",
+            "intensity": "How intense was it (1–10)?",
+            "onset_time": "When did it start?"
+        }
+    }
+}
+
 
 
 def ensure_timezone_aware(dt: Optional[datetime] = None) -> datetime:
@@ -311,10 +379,58 @@ class CompleteIntegratedSystem:
             except Exception as e:
                 print(f"[warn] scheduler chat-mode config skipped: {e}")
 
+    # ---------- robust/tolerant logging so missing fields never drop an entry ----------
+    def _log_entry_tolerant(
+            self,
+            category_name: str,
+            data: dict,
+            raw_text: str,
+            *,
+            extracted_by: str = "system",
+            confidence: float | None = None,
+            session_id: str | None = None,
+    ) -> bool:
+        """Best-effort logger.
+        If the category enforces required fields and raises (e.g. "Required field 'bedtime' missing"),
+        we append a partial record directly to {category}.jsonl with schema_ok=False so nothing is lost.
+        """
+        self._ensure_log_category(category_name, description="auto", fields={})
+        try:
+            self.logbook.log_entry(
+                category_name=category_name,
+                data=data,
+                raw_text=raw_text,
+                extracted_by=extracted_by,
+                confidence=confidence,
+                session_id=session_id,
+            )
+            return True
+        except Exception as e:
+            msg = str(e)
+            missing = re.findall(r"Required field '([^']+)'", msg)
+            rec = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "category": category_name,
+                "data": data,
+                "raw_text": raw_text,
+                "extracted_by": extracted_by,
+                "confidence": confidence,
+                "session_id": session_id,
+                "schema_ok": False,
+                "missing_fields": missing,
+                "error": msg,
+            }
+            cat_dir = Path(self.paths["logbooks"]) / category_name
+            cat_path = cat_dir / f"{category_name}.jsonl"
+            cat_dir.mkdir(parents=True, exist_ok=True)
+            with cat_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(f"[warn] tolerant log: wrote partial record to {cat_path} (missing={missing or 'unknown'})")
+            return False
 
         # --- Compose a conversational reply for chat mode -----------------------
     def _compose_chat_reply(self, message: str, similar_messages: List[str], harmonized: Dict,
-                            max_ctx: int = 300) -> str:
+                            max_ctx: int = 300, probe_cues: Optional[List[str]] = None) -> str:
         """
         Produce a user-facing reply that actually *uses* context and harmonized labels.
         Never asks to end the session; designed for free-form chat.
@@ -334,12 +450,20 @@ class CompleteIntegratedSystem:
             # keep snippets short, plain
             ctx_snips.append(txt)
 
+        # Add optional probing instructions (ask at most one question, and only if natural)
+        probe_cues = probe_cues or []
+        probes_blob = json.dumps(probe_cues[:1], ensure_ascii=False)
+
         sys_prompt = (
             "You are a friend and collaborator in free-form chat mode. "
             "Use the user's current message and the context of similar messages from history to form a personalized response."
             "Be concrete and grounded in the context; do not invent details not implied by them. "
-            "DO NOT try to end the conversation or suggest ending; "
-            "keep the tone open-ended."
+            "DO NOT try to end the conversation or suggest ending; keep the tone open-ended.\n"
+            "\n"
+            "If a PROBES list is provided, consider asking exactly one short, natural question near the end to fill a missing detail, "
+            "but only if it fits the flow. If none fit, skip it. Avoid bullet lists; just ask it conversationally. "
+            "Never ask more than one probe in a single reply.\n"
+            f"PROBES: {probes_blob}\n"
         )
 
         ctx_blob = json.dumps({
@@ -361,7 +485,55 @@ class CompleteIntegratedSystem:
             hint = ", ".join([t for t in spec_topics if t]) or "your themes"
             return f"I hear you. Based on {hint}, I’ve pulled a few relevant notes from your history. Want to go deeper on one of these or take an actionable next step?"
 
+    # ---- Probe for missing attributes across recent logs --------------------
+    def _probe_missing_attributes(self, days_back: int = 3, max_probes: int = 1) -> List[str]:
+        """
+        Scan recent logbook entries to see which common fields are consistently missing.
+        Returns up to max_probes human-friendly questions the conversationalist can ask.
+        """
+        if not hasattr(self, "logbook") or not getattr(self.logbook, "categories", None):
+            return []
+        cues: List[str] = []
+        # defensive loader; shapes can vary: entries may be flat, or have 'data'
+        def _fields_of(entry: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(entry, dict):
+                return {}
+            if "data" in entry and isinstance(entry["data"], dict):
+                return entry["data"]
+            return entry
 
+        for cat, spec in PROBE_SPECS.items():
+            if cat not in self.logbook.categories:
+                continue
+            try:
+                entries = self.logbook.load_category_context(cat, days_back=days_back, max_entries=200) or []
+            except Exception:
+                continue
+            if not entries:
+                # Don't probe for categories with no data yet; we'll let the extractor propose new ones.
+                continue
+            # look at the last few entries for persistent gaps
+            recent = entries[-10:] if len(entries) > 10 else entries
+            missing_fields = []
+            for field in spec.get("fields", []):
+                # Consider a field "missing" if it's absent or empty in ALL recent entries
+                all_missing = True
+                for e in recent:
+                    v = _fields_of(e).get(field, None)
+                    if v not in (None, "", [], {}):
+                        all_missing = False
+                        break
+                if all_missing:
+                    missing_fields.append(field)
+            for mf in missing_fields:
+                q = spec.get("questions", {}).get(mf)
+                if q:
+                    cues.append(q)
+                if len(cues) >= max_probes:
+                    break
+            if len(cues) >= max_probes:
+                break
+        return cues[:max_probes]
 
     # ==================== NEW TWO-TIER CONTEXT METHODS ====================
 
@@ -444,13 +616,13 @@ class CompleteIntegratedSystem:
 
         if avg_similarity > 0.7:
             # High similarity - focused context
-            return categories, 3650, 36500
+            return categories, 3650, 300000
         elif avg_similarity < 0.3:
             # Low similarity - broad context
-            return categories, 3650, 36500
+            return categories, 3650, 300000
         else:
             # Medium similarity
-            return categories, 3650, 36500
+            return categories, 3650, 300000
 
     # ==================== UPDATED MAIN METHODS ====================
 
@@ -506,8 +678,15 @@ class CompleteIntegratedSystem:
                         log_context[category] = entries
 
 
-        #Compose a user-facing chat reply (chat mode)
-        assistant_text = self._compose_chat_reply(message, similar_messages, harmonized)
+        # Compute optional probe cues (ask at most one thing per turn)
+        try:
+            probe_cues = [] if os.getenv("BB_PROBES", "1") != "1" else self._probe_missing_attributes(days_back=3, max_probes=1)
+            if probe_cues:
+                print(f"[probe] suggesting: {probe_cues}")
+        except Exception as _e:
+            probe_cues = []
+        # Compose a user-facing chat reply (chat mode)
+        assistant_text = self._compose_chat_reply(message, similar_messages, harmonized, probe_cues=probe_cues)
 
         # Process based on active session type
         if self.active_check_in:
@@ -580,11 +759,19 @@ class CompleteIntegratedSystem:
                 self.active_planning = self.active_planning or {"started_at": datetime.now(timezone.utc).isoformat()}
                 draft = self.schedule_bridge.append_suggestions(suggestions)
                 response["planning"] = {"state": "draft", "date": draft["date"], "tasks": draft["tasks"]}
+                response.setdefault("schedule_debug", {})["stage"] = "draft"
+                response["schedule_debug"]["suggestions"] = len(suggestions)
+                response["schedule_debug"]["emails_enabled"] = bool(getattr(self.schedule_bridge.notifier, "enabled", False))
+                response["schedule_debug"]["reminders_file"] = str(self.schedule_bridge.reminders_file)
 
             if plan.get("trigger") == "finalize":
                 finalized = self.schedule_bridge.finalize_draft(tz=str(self.tz), send_emails=True)
                 self.active_planning = None
                 response["planning"] = {"state": "finalized", **finalized}
+                response.setdefault("schedule_debug", {})["stage"] = "finalized"
+                response["schedule_debug"]["events"] = len(finalized.get("events", []))
+                response["schedule_debug"]["emails_enabled"] = bool(getattr(self.schedule_bridge.notifier, "enabled", False))
+                response["schedule_debug"]["reminders_file"] = str(self.schedule_bridge.reminders_file)
 
         # Save harmonized labels to disk
         if harmonized:
@@ -653,6 +840,8 @@ class CompleteIntegratedSystem:
         response["response"] = assistant_text  # <-- ensure chat has an actual reply
         response["keep_alive"] = True  # <-- front-end can use this to avoid auto-closing chat
         response["mode"] = "chat"
+        if probe_cues:
+            response["probe_cues"] = probe_cues
         response["features"] = {
             "vocabulary_richness": features.vocabulary_richness,
             "rare_words": features.rare_word_count,
@@ -756,15 +945,15 @@ class CompleteIntegratedSystem:
                             'tone': harmonized.get('tone', [{}])[0].get('label') if harmonized.get('tone') else None
                         }
 
-                        self.logbook.log_entry(
+                        ok = self._log_entry_tolerant(
                             category_name=category,
                             data=activity.get("data", {}),
                             raw_text=message,
                             extracted_by="check_in",
                             confidence=activity.get("confidence", 0.8),
-                            session_id=session_id
+                            session_id=session_id,
                         )
-                        extracted_data["logged"].append(category)
+                        extracted_data["logged"].append(category if ok else f"{category} (partial)")
                     except Exception as e:
                         print(f"Error logging to {category}: {e}")
 
@@ -841,13 +1030,18 @@ class CompleteIntegratedSystem:
                     except Exception as e:
                         print(f"[warn] could not create log category '{category}': {e}")
                 if category in self.logbook.categories:
-                    try:
-                        self.logbook.log_entry(category_name=category, data=item.get("data", {}),
-                                               raw_text=message, extracted_by="quick_log",
-                                               confidence=item.get("confidence", 0.8))
-                        logged.append(category)
-                    except Exception as e:
-                        print(f"[warn] logging to {category} failed: {e}")
+                    if category in self.logbook.categories:
+                        ok = self._log_entry_tolerant(
+                            category_name=category,
+                            data=item.get("data", {}),
+                            raw_text=message,
+                            extracted_by="quick_log",
+                            confidence=item.get("confidence", 0.8),
+                        )
+                        if ok:
+                            logged.append(category)
+                        else:
+                            logged.append(f"{category} (partial)")
 
             # --- optional: inventory updates as plain entries ---
             for inv in extracted.get("inventory_updates", []):
@@ -880,15 +1074,18 @@ class CompleteIntegratedSystem:
 
             # minimal fallback session log if nothing landed
             if not logged:
-                try:
-                    self._ensure_log_category("sessions", description="Freeform chat sessions (auto-created)",
-                                              fields={"summary": "string", "tokens": "int"})
-                    self.logbook.log_entry(category_name="sessions",
-                                           data={"summary": "chat_message", "tokens": len(message.split())},
-                                           raw_text=message, extracted_by="chat_fallback")
+                self._ensure_log_category("sessions", description="Freeform chat sessions (auto-created)",
+                                          fields={"summary": "string", "tokens": "int"})
+                ok = self._log_entry_tolerant(
+                    category_name="sessions",
+                    data={"summary": "chat_message", "tokens": len(message.split())},
+                    raw_text=message,
+                    extracted_by="chat_fallback",
+                )
+                if ok:
                     logged.append("sessions")
-                except Exception as e:
-                    print(f"[warn] fallback session log failed: {e}")
+                else:
+                    logged.append("sessions (partial)")
 
             return {
                 "logged": logged,
@@ -1280,8 +1477,8 @@ class CompleteIntegratedSystem:
         for category_name, category in self.logbook.categories.items():
             entries = self.logbook.load_category_context(
                 category_name,
-                days_back=365,
-                max_entries=500000
+                days_back=30,
+                max_entries=300
             )
 
             # Filter to today
