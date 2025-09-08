@@ -357,27 +357,30 @@ class CompleteIntegratedSystem:
         if hasattr(self.harmonizer, 'embedding_cache'):
             print(f"   Cached embeddings: {len(self.harmonizer.embedding_cache)}")
 
-            # ---- NEW: timezone & scheduler bridge ----
-            self.tz = ZoneInfo(os.getenv("BB_TZ", "America/Kentucky/Louisville"))
-            self.schedule_bridge = ScheduleBridge(planner_dir=planner_dir, openai_client=self.openai_client)
-            self.active_planning: dict | None = None  # holds a working schedule state during chat
+        # ---- ALWAYS initialize timezone & scheduler bridge (keep out of conditionals) ----
+        self.tz = ZoneInfo(os.getenv("BB_TZ", "America/Kentucky/Louisville"))
+        self.schedule_bridge: ScheduleBridge = ScheduleBridge(
+            planner_dir=planner_dir,
+            openai_client=self.openai_client
+        )
+        self.active_planning: Optional[dict] = None  # working schedule state during chat
 
-            # ---- NEW: ensure default categories exist (auto-create if missing) ----
-            self._ensure_default_log_categories()
+        # ---- ensure default categories exist (auto-create if missing) ----
+        self._ensure_default_log_categories()
 
-            # ---- Chat-mode defaults: keep sessions open, no auto-timeout
-            self.mode = "chat"
-            self.keepalive = True
-            try:
-                # Soft-configure schedulers if they expose knobs; ignore if not present.
-                if hasattr(self.context_scheduler, "configure"):
-                    self.context_scheduler.configure(mode="chat", session_timeout=None, idle_autoclose=False)
-                elif hasattr(self.context_scheduler, "set_mode"):
-                    self.context_scheduler.set_mode("chat")
-                if hasattr(self.adaptive_scheduler, "configure"):
-                    self.adaptive_scheduler.configure(mode="chat", session_timeout=None)
-            except Exception as e:
-                print(f"[warn] scheduler chat-mode config skipped: {e}")
+        # ---- Chat-mode defaults: keep sessions open, no auto-timeout
+        self.mode = "chat"
+        self.keepalive = True
+        try:
+            # Soft-configure schedulers if they expose knobs; ignore if not present.
+            if hasattr(self.context_scheduler, "configure"):
+                self.context_scheduler.configure(mode="chat", session_timeout=None, idle_autoclose=False)
+            elif hasattr(self.context_scheduler, "set_mode"):
+                self.context_scheduler.set_mode("chat")
+            if hasattr(self.adaptive_scheduler, "configure"):
+                self.adaptive_scheduler.configure(mode="chat", session_timeout=None)
+        except Exception as e:
+            print(f"[warn] scheduler chat-mode config skipped: {e}")
 
     # ---------- robust/tolerant logging so missing fields never drop an entry ----------
     def _log_entry_tolerant(
@@ -757,17 +760,21 @@ class CompleteIntegratedSystem:
                 suggestions = response.get("schedule_suggestions", [])
                 # Create/update working planning state
                 self.active_planning = self.active_planning or {"started_at": datetime.now(timezone.utc).isoformat()}
-                draft = self.schedule_bridge.append_suggestions(suggestions)
-                response["planning"] = {"state": "draft", "date": draft["date"], "tasks": draft["tasks"]}
-                response.setdefault("schedule_debug", {})["stage"] = "draft"
-                response["schedule_debug"]["suggestions"] = len(suggestions)
-                response["schedule_debug"]["emails_enabled"] = bool(getattr(self.schedule_bridge.notifier, "enabled", False))
-                response["schedule_debug"]["reminders_file"] = str(self.schedule_bridge.reminders_file)
+                sb = getattr(self, "schedule_bridge", None)
+                if sb and hasattr(sb, "append_suggestions"):
+                    draft = sb.append_suggestions(suggestions)
+                    response["planning"] = {"state": "draft", "date": draft["date"], "tasks": draft["tasks"]}
+                else:
+                    print("[warn] schedule_bridge not available; skipping draft append")
 
             if plan.get("trigger") == "finalize":
-                finalized = self.schedule_bridge.finalize_draft(tz=str(self.tz), send_emails=True)
-                self.active_planning = None
-                response["planning"] = {"state": "finalized", **finalized}
+                sb = getattr(self, "schedule_bridge", None)
+                if sb and hasattr(sb, "finalize_draft"):
+                    finalized = sb.finalize_draft(tz=str(self.tz), send_emails=True)
+                    self.active_planning = None
+                    response["planning"] = {"state": "finalized", **finalized}
+                else:
+                    print("[warn] schedule_bridge not available; cannot finalize draft")
                 response.setdefault("schedule_debug", {})["stage"] = "finalized"
                 response["schedule_debug"]["events"] = len(finalized.get("events", []))
                 response["schedule_debug"]["emails_enabled"] = bool(getattr(self.schedule_bridge.notifier, "enabled", False))
@@ -1066,8 +1073,8 @@ class CompleteIntegratedSystem:
             # --- load-context requests ---
             loaded_context = {}
             for req in extracted.get("load_context", []):
-                cat = req.get("category");
-                db = int(req.get("days_back", 7));
+                cat = req.get("category")
+                db = int(req.get("days_back", 7))
                 mx = int(req.get("max_entries", 200))
                 if cat and cat in self.logbook.categories:
                     loaded_context[cat] = self.logbook.load_category_context(cat, days_back=db, max_entries=mx) or []

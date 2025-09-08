@@ -51,6 +51,8 @@ from assistant.logger.temporal_personal_profile import TemporalPersonalProfile
 from app.openai_client import OpenAIClient
 from assistant.behavioral_engine.schedulers.intelligent_scheduler import IntelligentSchedulingSystem
 from assistant.behavioral_engine.schedulers.intelligent_scheduler import ScheduleIntentType
+from dotenv import load_dotenv
+load_dotenv()
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]  # send+mark read; avoid /gmail.readonly if you modify
 BASE = pathlib.Path("secrets")  # up to you
@@ -58,6 +60,23 @@ TOKEN = BASE / "token.json"
 CLIENT = BASE / "credentials.json"
 CHECKPOINT = pathlib.Path("run_state/processed_ids.json")
 MAX_IDS = 5000  # rolling window
+
+# ---- SCOPES ---------------------------------------------------------------
+# Minimal set for what this runner actually does:
+#  - Read messages (search + fetch): gmail.readonly  (or gmail.metadata for list-only)
+#  - Send messages (reminders, replies): gmail.send
+# If you plan to modify labels / mark read, switch readonly -> gmail.modify.
+DEFAULT_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+# Allow override via env (space or comma separated)
+_scopes_env = os.getenv("BB_GMAIL_SCOPES", "")
+SCOPES = [s for s in (_scopes_env.replace(",", " ").split()) if s] or DEFAULT_SCOPES
+
+# Where to find your OAuth client and token cache
+CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_FILE", "credentials.json")
+TOKEN_FILE       = os.getenv("GMAIL_TOKEN_FILE", "token.json")
 
 def load_processed():
     try:
@@ -112,24 +131,42 @@ class GmailIntegration:
         self._authenticate()
 
     def _authenticate(self):
-        """Authenticate with Gmail using saved token or OAuth flow."""
+        """
+        OAuth using token.json (authorized_user JSON) instead of a pickled Credentials.
+        Also migrates legacy token.pickle → token.json if present.
+        """
+        token_path = pathlib.Path(TOKEN_FILE)
         creds = None
-
-        if os.path.exists(self.token_file):
-            with open(self.token_file, 'rb') as token:
-                creds = pickle.load(token)
-
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
+        if token_path.exists():
+            # Load existing token but DO NOT silently keep wrong scopes
+            creds = Credentials.from_authorized_user_file(str(token_path), scopes=SCOPES)
+            # If scopes changed, creds.valid may still be True but scopes won’t match the API calls you make.
+            if set((creds.scopes or [])) != set(SCOPES):
+                print(f"[auth] token scopes {creds.scopes} != required {SCOPES}; discarding token to force re-consent")
+                try:
+                    token_path.unlink()
+                except Exception:
+                    pass
+                creds = None
+        if creds and creds.expired and creds.refresh_token:
+            try:
                 creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    self.credentials_file, self.SCOPES
-                )
-                creds = flow.run_local_server(port=0)
+            except Exception as e:
+                print(f"[auth] refresh failed, falling back to interactive login: {e}")
+                creds = None
+        if not creds:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            # prompt='consent' ensures new scopes are granted; offline gives a refresh_token
+            creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
+            token_path.write_text(creds.to_json(), encoding="utf-8")
+        self.service = build("gmail", "v1", credentials=creds)
 
-            with open(self.token_file, 'wb') as token:
-                pickle.dump(creds, token)
+
+    def _save_creds_json(self, creds: Credentials, path: Path):
+        try:
+            path.write_text(creds.to_json(), encoding="utf-8")
+        except Exception as e:
+            print(f"[gmail] failed to persist token.json: {e}")
 
         self.service = build('gmail', 'v1', credentials=creds)
 

@@ -30,3 +30,6 @@ analysis_output/
 credentials.json
 token.pickle
 token.pickle.old
+token.json
+secrets/
+secrets/**

@@ -9,6 +9,19 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import threading
 import dotenv
+
+# --- Gmail API deps (OAuth) ---
+from base64 import urlsafe_b64encode
+try:
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+except Exception:
+    Credentials = None
+    InstalledAppFlow = None
+    Request = None
+    build = None
 dotenv.load_dotenv()
 
 class EmailNotifier:
@@ -33,6 +46,69 @@ class EmailNotifier:
             return True
         except Exception as e:
             print(f"[warn] email send failed: {e}")
+            return False
+
+class GmailApiNotifier:
+    """
+    Minimal Gmail API sender using OAuth token.json.
+    Requires scope: https://www.googleapis.com/auth/gmail.send
+    Env:
+      - GMAIL_CREDENTIALS_JSON: path to OAuth client secrets (credentials.json)
+      - GMAIL_TOKEN_JSON:       path to token.json (created after first consent)
+      - BB_EMAIL_TO or SMTP_TO: recipient (default 'me' if omitted)
+      - BB_EMAIL_FROM: optional From header (Gmail will still send as the account)
+      - BB_TZ: timezone (e.g., America/Kentucky/Louisville)
+    """
+    SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+
+    def __init__(self, env: dict):
+        self.tz = ZoneInfo(env.get("BB_TZ", "America/New_York"))
+        self.creds_path = Path(env.get("GMAIL_CREDENTIALS_JSON", "credentials.json"))
+        self.token_path = Path(env.get("GMAIL_TOKEN_JSON", "token.json"))
+        self.to_addr = env.get("BB_EMAIL_TO") or env.get("SMTP_TO")
+        self.from_addr = env.get("BB_EMAIL_FROM")  # optional header
+        self.enabled = bool(build) and self.creds_path.exists()
+        self._service = None
+
+    def _ensure_service(self) -> bool:
+        if not self.enabled:
+            print("[warn] GmailApiNotifier disabled: missing google-api libs or credentials.json")
+            return False
+        creds = None
+        if self.token_path.exists():
+            try:
+                creds = Credentials.from_authorized_user_file(str(self.token_path), self.SCOPES)
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+            except Exception as e:
+                print(f"[warn] token.json invalid, will re-auth: {e}")
+                creds = None
+        if not creds or not creds.valid:
+            flow = InstalledAppFlow.from_client_secrets_file(str(self.creds_path), self.SCOPES)
+            # Port 0 lets the OS pick a free port; override with BB_OAUTH_PORT if needed.
+            port = int(os.getenv("BB_OAUTH_PORT", "0"))
+            creds = flow.run_local_server(port=port)
+            self.token_path.write_text(creds.to_json(), encoding="utf-8")
+        self._service = build("gmail", "v1", credentials=creds)
+        return True
+
+    def send(self, subject: str, body: str) -> bool:
+        if not self._ensure_service():
+            return False
+        # If no explicit recipient was provided, Gmail will send to the account if header is omitted.
+        if not self.to_addr:
+            self.to_addr = "me"
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["To"] = self.to_addr
+        if self.from_addr:
+            msg["From"] = self.from_addr
+        msg["Subject"] = subject
+        raw = urlsafe_b64encode(msg.as_bytes()).decode("ascii")
+        try:
+            self._service.users().messages().send(userId="me", body={"raw": raw}).execute()
+            return True
+        except Exception as e:
+            print(f"[warn] gmail send failed: {e}")
             return False
 
 class GmailOAuthNotifier:
@@ -154,11 +230,15 @@ class ScheduleBridge:
         for p in (self.daily_dir, self.outbox_dir, self.drafts_dir): p.mkdir(parents=True, exist_ok=True)
         self.openai_client = openai_client
         self.tz = ZoneInfo(os.getenv("BB_TZ", "America/New_York"))
-        self.notifier = EmailNotifier(mail_env or os.environ)
+
+        env = (mail_env or os.environ)
+        transport = (env.get("BB_MAIL_TRANSPORT") or "").lower()
+        use_gmail = transport == "gmail" or env.get("GMAIL_TOKEN_JSON") or env.get("GMAIL_CREDENTIALS_JSON")
+        if use_gmail and Credentials and build:
+            self.notifier = GmailApiNotifier(env)
+        else:
+            self.notifier = EmailNotifier(env)
         self.reminders = ReminderDaemon(self.reminders_file, self.notifier)
-        self.openai_client = openai_client
-        self.tz = ZoneInfo(os.getenv("BB_TZ", "America/New_York"))
-        env = mail_env or os.environ
         mode = (env.get("BB_MAIL_MODE", "smtp") or "smtp").lower()
         if mode == "gmail_api":
             self.notifier = GmailOAuthNotifier(env)
