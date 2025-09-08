@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/extraction_record.schema.json",
+  "title": "ExtractionRecord v0.1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/entry"
+      },
+      "default": []
+    },
+    "schedule_suggestions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/scheduleSuggestion"
+      },
+      "default": []
+    },
+    "triggers": {
+      "type": "object",
+      "properties": {
+        "planning": {
+          "type": "string",
+          "enum": [
+            "start",
+            "continue",
+            "finalize",
+            "none"
+          ],
+          "default": "none"
+        }
+      },
+      "additionalProperties": false,
+      "default": {
+        "planning": "none"
+      }
+    },
+    "load_context": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/loadContextReq"
+      },
+      "default": []
+    },
+    "inventory_updates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/inventoryUpdate"
+      },
+      "default": []
+    }
+  },
+  "required": [],
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "required": [
+        "category"
+      ],
+      "properties": {
+        "category": {
+          "type": "string",
+          "minLength": 1
+        },
+        "data": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": true
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.8
+        }
+      },
+      "additionalProperties": false
+    },
+    "scheduleSuggestion": {
+      "type": "object",
+      "required": [
+        "title",
+        "duration_min"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "duration_min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "preferred_time": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+          "default": null
+        },
+        "day": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^(today|\\d{4}-\\d{2}-\\d{2})$",
+          "default": "today"
+        }
+      },
+      "additionalProperties": false
+    },
+    "loadContextReq": {
+      "type": "object",
+      "required": [
+        "category"
+      ],
+      "properties": {
+        "category": {
+          "type": "string",
+          "minLength": 1
+        },
+        "days_back": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 7
+        },
+        "max_entries": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 200
+        }
+      },
+      "additionalProperties": false
+    },
+    "inventoryUpdate": {
+      "type": "object",
+      "required": [
+        "category",
+        "item",
+        "qty"
+      ],
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": [
+            "inventory_pantry",
+            "inventory_house",
+            "inventory_car",
+            "inventory_tools",
+            "inventory_medications"
+          ]
+        },
+        "item": {
+          "type": "string",
+          "minLength": 1
+        },
+        "qty": {
+          "type": "number"
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "examples": [
+    {
+      "entries": [
+        {
+          "category": "meals",
+          "data": {
+            "what": "banquet meal",
+            "calories": 410
+          },
+          "confidence": 0.86
+        },
+        {
+          "category": "sleep",
+          "data": {
+            "bed": "02:10",
+            "wake": "14:00"
+          },
+          "confidence": 0.7
+        }
+      ],
+      "schedule_suggestions": [
+        {
+          "title": "Therapy travel buffer",
+          "duration_min": 30,
+          "preferred_time": "08:00",
+          "day": "today"
+        },
+        {
+          "title": "Meal prep",
+          "duration_min": 25,
+          "preferred_time": null,
+          "day": "2025-09-06"
+        }
+      ],
+      "triggers": {
+        "planning": "start"
+      },
+      "load_context": [
+        {
+          "category": "meals",
+          "days_back": 7,
+          "max_entries": 50
+        }
+      ],
+      "inventory_updates": [
+        {
+          "category": "inventory_pantry",
+          "item": "banquet meal",
+          "qty": -1,
+          "unit": "tray"
+        }
+      ]
+    }
+  ]
+}

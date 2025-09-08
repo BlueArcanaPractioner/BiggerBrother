@@ -289,6 +289,14 @@ class CompleteIntegratedSystem:
         if hasattr(self.harmonizer, 'embedding_cache'):
             print(f"   Cached embeddings: {len(self.harmonizer.embedding_cache)}")
 
+            # ---- NEW: timezone & scheduler bridge ----
+            self.tz = ZoneInfo(os.getenv("BB_TZ", "America/Kentucky/Louisville"))
+            self.schedule_bridge = ScheduleBridge(planner_dir=planner_dir, openai_client=self.openai_client)
+            self.active_planning: dict | None = None  # holds a working schedule state during chat
+
+            # ---- NEW: ensure default categories exist (auto-create if missing) ----
+            self._ensure_default_log_categories()
+
             # ---- Chat-mode defaults: keep sessions open, no auto-timeout
             self.mode = "chat"
             self.keepalive = True
@@ -303,62 +311,57 @@ class CompleteIntegratedSystem:
             except Exception as e:
                 print(f"[warn] scheduler chat-mode config skipped: {e}")
 
+
         # --- Compose a conversational reply for chat mode -----------------------
-        def _compose_chat_reply(self, message: str, similar_messages: List[str], harmonized: Dict,
-                                max_ctx: int = 300) -> str:
-            """
-            Produce a user-facing reply that actually *uses* context and harmonized labels.
-            Never asks to end the session; designed for free-form chat.
-            """
-            # Summarize labels succinctly (specific groups first)
-            spec_topics = [l.get('specific_group', l.get('label')) for l in harmonized.get('topic', [])][:3]
-            tones = [l.get('label') for l in harmonized.get('tone', [])][:2]
-            intents = [l.get('label') for l in harmonized.get('intent', [])][:2]
+    def _compose_chat_reply(self, message: str, similar_messages: List[str], harmonized: Dict,
+                            max_ctx: int = 300) -> str:
+        """
+        Produce a user-facing reply that actually *uses* context and harmonized labels.
+        Never asks to end the session; designed for free-form chat.
+        """
+        # Summarize labels succinctly (specific groups first)
+        spec_topics = [l.get('specific_group', l.get('label')) for l in harmonized.get('topic', [])][:3]
+        tones = [l.get('label') for l in harmonized.get('tone', [])][:2]
+        intents = [l.get('label') for l in harmonized.get('intent', [])][:2]
 
-            ctx_snips = []
-            for s in similar_messages:
-                if not isinstance(s, str):
-                    continue
-                txt = s.strip()
-                if not txt:
-                    continue
-                # keep snippets short, plain
-                ctx_snips.append(txt)
+        ctx_snips = []
+        for s in similar_messages:
+            if not isinstance(s, str):
+                continue
+            txt = s.strip()
+            if not txt:
+                continue
+            # keep snippets short, plain
+            ctx_snips.append(txt)
 
-            sys_prompt = (
-                "You are a friend and collaborator in free-form chat mode. "
-                "Use the user's current message and the context of similar messages from history to form a personalized response."
-                "Be concrete and grounded in the context; do not invent details not implied by them. "
-                "DO NOT try to end the conversation or suggest ending; "
-                "keep the tone open-ended."
+        sys_prompt = (
+            "You are a friend and collaborator in free-form chat mode. "
+            "Use the user's current message and the context of similar messages from history to form a personalized response."
+            "Be concrete and grounded in the context; do not invent details not implied by them. "
+            "DO NOT try to end the conversation or suggest ending; "
+            "keep the tone open-ended."
+        )
+
+        ctx_blob = json.dumps({
+            "context_snippets": ctx_snips
+        }, ensure_ascii=False)
+
+        try:
+            reply = self.openai_client.chat(
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": f"CURRENT MESSAGE:\n{message}\n\nCONTEXT:\n{ctx_blob}"}
+                ],
+                model="gpt-5"
             )
+            return reply.strip()
+        except Exception as e:
+            # Fall back to a minimal, non-generic template
+            # (still contains detected topics so it isn't a blank platitude)
+            hint = ", ".join([t for t in spec_topics if t]) or "your themes"
+            return f"I hear you. Based on {hint}, I’ve pulled a few relevant notes from your history. Want to go deeper on one of these or take an actionable next step?"
 
-            ctx_blob = json.dumps({
-                "context_snippets": ctx_snips
-            }, ensure_ascii=False)
 
-            try:
-                reply = self.openai_client.chat(
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": f"CURRENT MESSAGE:\n{message}\n\nCONTEXT:\n{ctx_blob}"}
-                    ],
-                    model="gpt-5"
-                )
-                return reply.strip()
-            except Exception as e:
-                # Fall back to a minimal, non-generic template
-                # (still contains detected topics so it isn't a blank platitude)
-                hint = ", ".join([t for t in spec_topics if t]) or "your themes"
-                return f"I hear you. Based on {hint}, I’ve pulled a few relevant notes from your history. Want to go deeper on one of these or take an actionable next step?"
-
-        # ---- NEW: timezone & scheduler bridge ----
-        self.tz = ZoneInfo(os.getenv("BB_TZ", "America/Kentucky/Louisville"))
-        self.schedule_bridge = ScheduleBridge(planner_dir=planner_dir, openai_client=self.openai_client)
-        self.active_planning: dict | None = None  # holds a working schedule state during chat
-
-        # ---- NEW: ensure default categories exist (auto-create if missing) ----
-        self._ensure_default_log_categories()
 
     # ==================== NEW TWO-TIER CONTEXT METHODS ====================
 
@@ -1392,7 +1395,6 @@ The system uses Two-Tier Harmonization:
 # Main CLI for the complete system
 def main():
     """Interactive CLI for the complete integrated system."""
-    import sys
 
     print("🧠 BiggerBrother - Complete Behavioral Intelligence System")
     print("   with Two-Tier Harmonization and Fast Context Lookups")
