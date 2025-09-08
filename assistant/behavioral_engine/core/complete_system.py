@@ -326,7 +326,7 @@ class CompleteIntegratedSystem:
                 ctx_snips.append(txt)
 
             sys_prompt = (
-                "You are a helpful assistant replying in free-form chat mode. "
+                "You are a friend and collaborator in free-form chat mode. "
                 "Use the user's current message and the context of similar messages from history to form a personalized response."
                 "Be concrete and grounded in the context; do not invent details not implied by them. "
                 "DO NOT try to end the conversation or suggest ending; "
